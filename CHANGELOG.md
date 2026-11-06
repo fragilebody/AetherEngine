@@ -8,6 +8,26 @@ Versioning follows [Semantic Versioning](https://semver.org). See
 [README › Stability and versioning](README.md#stability-and-versioning) for
 the public-API contract.
 
+## Fork: fragilebody/AetherEngine, branch `memory-segments`
+
+This fork is upstream plus one change, rebased onto each upstream tag it follows (see
+[FORK.md](FORK.md)). Fork tags are `<upstream tag>-memory.<n>`.
+
+### 7.58.0-memory.1 - 2026-11-05 (on upstream 7.58.0)
+
+- **Loopback segments can stay in RAM instead of being written to disk
+  (`LoadOptions.segmentMemoryBudgetBytes`).** On the native loopback route every remuxed HLS-fMP4
+  segment was written to a staging file under `aether-segments/` and served mmapped, so playback wrote
+  every byte watched to disk once (about 90 MB per minute at 12 Mbit/s). With a budget set, the muxer
+  writes each new segment into a purgeable memory buffer while the segments in memory fit the budget,
+  the cache adopts the buffer as it stands, and the loopback server serves it without a copy;
+  progressive delivery follows the growing buffer. A segment that would exceed the budget is written to
+  disk as before, and never moved between stores afterwards; later segments return to memory once
+  eviction frees room. Segments AVPlayer has not fetched yet are pinned; watched history is purgeable
+  and evicted farthest from the playhead first within the memory budget, and a segment macOS reclaimed
+  reads as missing and is produced again (the AE#451 path). nil, the default, keeps every segment on
+  disk exactly as upstream. VOD only.
+
 ## [Unreleased]
 
 _Nothing yet._

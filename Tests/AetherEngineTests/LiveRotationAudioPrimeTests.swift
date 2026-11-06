@@ -195,7 +195,7 @@ struct LiveRotationAudioPrimeTests {
                 "dec3 must be derivable from a BRIDGE-OUTPUT frame, not just a source frame")
 
         try rig.writeAllVideoPackets(into: muxer)
-        guard case .completed(let path, let bytes) = muxer.cutFragmentForNextSegment(415) else {
+        guard case .completed(.file(let path), let bytes) = muxer.cutFragmentForNextSegment(415) else {
             Issue.record("primed rotation cut must complete")
             return
         }

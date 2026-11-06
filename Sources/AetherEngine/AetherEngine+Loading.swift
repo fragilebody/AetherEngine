@@ -936,6 +936,8 @@ extension AetherEngine {
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
         session.audioShaping = loadedOptions.audioShaping
         session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
+        // Fork (memory-segments): read by start(), where the segment cache is built.
+        session.segmentMemoryBudgetBytes = loadedOptions.segmentMemoryBudgetBytes
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
         session.sideReaderLinkGate = sideReaderLinkGate

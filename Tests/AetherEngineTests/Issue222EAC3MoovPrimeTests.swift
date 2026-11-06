@@ -230,7 +230,7 @@ struct Issue222EAC3MoovPrimeTests {
         try rig.writeAllVideoPackets(into: muxer)
         let outcome = muxer.cutFragmentForNextSegment(1)
 
-        guard case .completed(let path, let bytes) = outcome else {
+        guard case .completed(.file(let path), let bytes) = outcome else {
             Issue.record("primed cut must complete, got \(outcome)")
             return
         }
@@ -260,7 +260,7 @@ struct Issue222EAC3MoovPrimeTests {
         let audioDts: Int64 = 12 * 48000
         try rig.writeAudioFrame(prime, dts: audioDts, into: muxer)
 
-        guard case .completed(let path, _) = muxer.cutFragmentForNextSegment(1) else {
+        guard case .completed(.file(let path), _) = muxer.cutFragmentForNextSegment(1) else {
             Issue.record("primed cut must complete")
             return
         }

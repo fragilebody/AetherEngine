@@ -1008,6 +1008,16 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Optional temporary session-cache budget. Nil retains automatic sizing; zero keeps only the working window.
     public var sessionCacheByteBudget: Int? = nil
+
+    /// Fork (memory-segments): byte budget for loopback VOD segments held in RAM instead of on disk.
+    /// While the segments in memory fit it, the muxer writes each new segment into a purgeable memory
+    /// buffer and the loopback server serves it from there, so nothing is written to disk; a segment
+    /// that would exceed it is written to disk as without this option, and later segments return to
+    /// memory once eviction frees room. Watched history is purgeable, so macOS may reclaim it under
+    /// memory pressure (a reclaimed segment is produced again if it is asked for). Counted apart from
+    /// `sessionCacheByteBudget`, which keeps bounding the disk. nil (the default) keeps every segment on
+    /// disk. VOD only; ignored on live, `nativeRemoteHLS` and the software path.
+    public var segmentMemoryBudgetBytes: Int? = nil
     /// Compressed-packet storage for seekable software VOD; automatic retains platform defaults.
     public var softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic
 
@@ -1171,6 +1181,7 @@ public struct LoadOptions: Sendable, Equatable {
         initialSubtitleTrackID: Int? = nil,
         forwardBufferSegments: Int? = nil,
         sessionCacheByteBudget: Int? = nil,
+        segmentMemoryBudgetBytes: Int? = nil,
         softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic,
         progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
@@ -1236,6 +1247,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.initialSubtitleTrackID = initialSubtitleTrackID
         self.forwardBufferSegments = forwardBufferSegments
         self.sessionCacheByteBudget = sessionCacheByteBudget
+        self.segmentMemoryBudgetBytes = segmentMemoryBudgetBytes
         self.softwarePacketCacheStorage = softwarePacketCacheStorage
         self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay
