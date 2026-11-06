@@ -60,3 +60,9 @@ git push origin <new-tag>-memory.1
 Conflicts land almost always in `SegmentCache.swift` (entries are `SegmentStorage`, not `URL`) and in
 `MP4SegmentMuxer.swift` (the staging is `SegmentStaging`). Then bump the host app's exact package
 version to the new fork tag.
+
+## Quiet logging
+
+Engine log lines no longer go to OSLog (and so the Xcode/terminal console) unless the `AETHER_LOG`
+environment variable is set to a value other than `0`. Host handlers (`EngineLog.handler`) still get
+every `.info` line. See `EngineLog.osLogEnabled`.
