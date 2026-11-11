@@ -220,6 +220,12 @@ final class SoftwarePlaybackHost {
     /// Typed loosely because the class does not exist in simulator builds or before OS 26.
     private(set) var frameUpscaler: AnyObject?
 
+    /// `LoadOptions.videoDither`, set by the load before `load(demuxer:...)`; non-nil dithers every SDR frame.
+    var videoDither: VideoDitherOptions?
+
+    /// The dither pass built for `videoDither`, nil when none was.
+    private(set) var frameDitherer: VideoDitherer?
+
     /// Forwarded Dolby Vision profile number (e.g. 7, 8) if detected from bitstream or container
     var configuredDVProfile: Int?
 
@@ -1219,6 +1225,23 @@ final class SoftwarePlaybackHost {
         return handler
     }
 
+    /// `handler` behind the dither pass when `videoDither` is set and the pass builds, else unchanged. It
+    /// runs last, on the frame the display layer gets (after the upscale stage). Never for the dual-layer
+    /// decoder, whose frames are HDR; the pass itself returns HDR frames untouched.
+    func ditheredFrameHandler(
+        _ handler: @escaping DecodedFrameHandler,
+        decoder: any VideoDecodingPipeline
+    ) -> DecodedFrameHandler {
+        frameDitherer = nil
+        guard let options = videoDither, !Self.isDualLayer(decoder) else { return handler }
+        guard let stage = VideoDitherer(options: options) else {
+            EngineLog.emit("[Dither] not built: no Metal device, frames are delivered as decoded", category: .swPlayback)
+            return handler
+        }
+        frameDitherer = stage
+        return DitheringFrameHandler.wrap(handler) { stage.dither($0) }
+    }
+
     // MARK: - Load
 
     func load(
@@ -1454,8 +1477,10 @@ final class SoftwarePlaybackHost {
             }
         }
 
+        // Innermost wraps last: a frame is upscaled first, then dithered, then enqueued.
         let onFrame = upscaledFrameHandler(
-            baseOnFrame, decoder: videoDecoder, frameRate: AetherEngine.detectFrameRate(stream: vStream))
+            ditheredFrameHandler(baseOnFrame, decoder: videoDecoder),
+            decoder: videoDecoder, frameRate: AetherEngine.detectFrameRate(stream: vStream))
 
         if vStream.pointee.codecpar?.pointee.codec_id == AV_CODEC_ID_VP9 {
             let opened = try VideoDecoderOpener.openPreferredOrFallback(

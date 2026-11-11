@@ -559,6 +559,16 @@ public struct LoadOptions: Sendable, Equatable {
     /// in place, and turning it on is refused with `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`.
     public var upscalesLowResolutionVideo: Bool = false
 
+    /// Dither SDR video on the software path, as mpv does: each decoded frame is converted to R'G'B' at
+    /// full precision and quantised to 8 or 10 bits through a threshold matrix (`VideoDitherer`), so the
+    /// rounding of the conversion shows as fine noise instead of bands. nil (the default) delivers frames
+    /// as decoded. HDR and Dolby Vision frames, and the dual-layer route, are never dithered. The native
+    /// AVPlayer route is not touched: the engine does not see its frames, and a host that takes them
+    /// itself runs `VideoDitherer` on them.
+    ///
+    /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change.
+    public var videoDither: VideoDitherOptions? = nil
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -1141,6 +1151,7 @@ public struct LoadOptions: Sendable, Equatable {
         preferDualLayerDolbyVision: Bool = false,
         dualLayerRoute: DualLayerRoute = .softwareHost,
         upscalesLowResolutionVideo: Bool = false,
+        videoDither: VideoDitherOptions? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -1207,6 +1218,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
         self.dualLayerRoute = dualLayerRoute
         self.upscalesLowResolutionVideo = upscalesLowResolutionVideo
+        self.videoDither = videoDither
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel

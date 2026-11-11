@@ -56,6 +56,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "Network/EngineTLS.swift",
         "FrameExtractor/FrameExtractor.swift",
         "Recording/RecordingState.swift",
+        "Video/VideoDitherer.swift",
     ]
 
     /// Public, and deliberately undocumented as host API. Each entry is a claim that an adopter

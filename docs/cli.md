@@ -116,6 +116,7 @@ swift run aetherctl play --fel --fel-output <p7-file.mkv>      # compose it on A
 swift run aetherctl play --fel --surface --cycle-el 10 <p7-file.mkv>   # flip the residual off and on every 10 s over a visible window (--window is the same flag)
 swift run aetherctl play --fel --surface --dv-pin 'darkest:240,period:2' <url>   # DEBUG: pulse a pinned frame's DV metadata (from dvsurvey)
 swift run aetherctl play --upscale <sd-or-720p-url>           # opt in to upscaling sub-1080p SDR video to the display (LoadOptions.upscalesLowResolutionVideo, #846); logs one [Upscale] line and an UPSCALE line once the first frame is upscaled
+swift run aetherctl play --sw --dither <sdr-url>               # dither SDR video on the software path as mpv does (LoadOptions.videoDither, defaults: fruit matrix, 10 bits); logs one [Dither] line with the first dithered frame
 ```
 
 `--host-calls nativesubs,nativerender@N,subsoff@N,subson@N,lanreload@N` drives the NATIVE SUBTITLE RENDITION path

@@ -10,7 +10,7 @@ the public-API contract.
 
 ## Fork: fragilebody/AetherEngine, branch `memory-segments`
 
-This fork is upstream plus one change, rebased onto each upstream tag it follows (see
+This fork is upstream plus a few changes, rebased onto each upstream tag it follows (see
 [FORK.md](FORK.md)). Fork tags are `<upstream tag>-memory.<n>`.
 
 ### 7.58.0-memory.1 - 2026-11-05 (on upstream 7.58.0)
@@ -27,6 +27,19 @@ This fork is upstream plus one change, rebased onto each upstream tag it follows
   and evicted farthest from the playhead first within the memory budget, and a segment macOS reclaimed
   reads as missing and is produced again (the AE#451 path). nil, the default, keeps every segment on
   disk exactly as upstream. VOD only.
+
+### 7.58.0-memory.3 - 2026-11-10 (on upstream 7.58.0)
+
+- **SDR video can be dithered the way mpv does it (`LoadOptions.videoDither`, `VideoDitherer`).**
+  Decoded Y'CbCr went to the display layer as it was and the system converted it to RGB, rounding
+  however it chose; a host that pulled AVPlayer's frames as 8-bit BGRA got 10-bit video rounded to
+  8 bits with nothing to hide the steps, which shows as bands in gradients. With the option set, the
+  software path converts each SDR frame to R'G'B' at full precision in one Metal pass and quantises it
+  through a threshold matrix tiled over the picture: mpv's blue-noise "fruit" matrix (a port of its
+  generator) or a Bayer matrix, optionally turned from frame to frame. The depth is 10 bits by default
+  (`.auto`, frames go out as 10-bit RGB) or 8. `VideoDitherer` is public, so a host that takes AVPlayer's
+  frames itself runs the same pass on the native route. HDR and Dolby Vision frames are never touched.
+  nil, the default, is upstream behaviour unchanged.
 
 ## [Unreleased]
 
