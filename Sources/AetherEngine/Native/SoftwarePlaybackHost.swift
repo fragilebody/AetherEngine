@@ -223,7 +223,10 @@ final class SoftwarePlaybackHost {
     /// `LoadOptions.videoDither`, set by the load before `load(demuxer:...)`; non-nil dithers every SDR frame.
     var videoDither: VideoDitherOptions?
 
-    /// The dither pass built for `videoDither`, nil when none was.
+    /// `LoadOptions.videoDeband`, set with `videoDither`; non-nil debands every SDR frame.
+    var videoDeband: VideoDebandOptions?
+
+    /// The pass built for `videoDither` and `videoDeband`, nil when none was.
     private(set) var frameDitherer: VideoDitherer?
 
     /// Forwarded Dolby Vision profile number (e.g. 7, 8) if detected from bitstream or container
@@ -1225,21 +1228,29 @@ final class SoftwarePlaybackHost {
         return handler
     }
 
-    /// `handler` behind the dither pass when `videoDither` is set and the pass builds, else unchanged. It
-    /// runs last, on the frame the display layer gets (after the upscale stage). Never for the dual-layer
-    /// decoder, whose frames are HDR; the pass itself returns HDR frames untouched.
+    /// `handler` behind the dither pass when `videoDither` or `videoDeband` is set and the pass builds, else
+    /// unchanged. It runs last, on the frame the display layer gets (after the upscale stage). Never for the
+    /// dual-layer decoder, whose frames are HDR; the pass itself returns HDR frames untouched.
     func ditheredFrameHandler(
         _ handler: @escaping DecodedFrameHandler,
         decoder: any VideoDecodingPipeline
     ) -> DecodedFrameHandler {
         frameDitherer = nil
-        guard let options = videoDither, !Self.isDualLayer(decoder) else { return handler }
-        guard let stage = VideoDitherer(options: options) else {
+        guard videoDither != nil || videoDeband != nil, !Self.isDualLayer(decoder) else { return handler }
+        // Deband alone rounds at the default depth instead of dithering.
+        let options = videoDither ?? VideoDitherOptions(algorithm: .none)
+        guard let stage = VideoDitherer(options: options, deband: videoDeband) else {
             EngineLog.emit("[Dither] not built: no Metal device, frames are delivered as decoded", category: .swPlayback)
             return handler
         }
         frameDitherer = stage
-        return DitheringFrameHandler.wrap(handler) { stage.dither($0) }
+        // Frames the upscale stage enlarged keep the deband radius in source pixels.
+        let sourceHeight = upscalePlan?.sourceHeight ?? 0
+        return DitheringFrameHandler.wrap(handler) { buffer in
+            let height = CVPixelBufferGetHeight(buffer)
+            let scale = sourceHeight > 0 ? max(1, Double(height) / Double(sourceHeight)) : 1
+            return stage.dither(buffer, debandRangeScale: scale)
+        }
     }
 
     // MARK: - Load

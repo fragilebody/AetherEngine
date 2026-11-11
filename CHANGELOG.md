@@ -41,6 +41,20 @@ This fork is upstream plus a few changes, rebased onto each upstream tag it foll
   frames itself runs the same pass on the native route. HDR and Dolby Vision frames are never touched.
   nil, the default, is upstream behaviour unchanged.
 
+### 7.58.0-memory.4 - 2026-11-10 (on upstream 7.58.0)
+
+- **Banding that is already in SDR video can be removed the way mpv's `--deband` does
+  (`LoadOptions.videoDeband`, `VideoDebandOptions`).** Dithering only hides the rounding the player
+  adds; bands the encoder left in the file stayed. The dither pass now has a deband stage in front of
+  the conversion to R'G'B', a port of libplacebo's `pl_shader_deband` (which mpv's `vo=gpu-next` runs):
+  each pixel is compared with the average of four samples at a random distance and angle and takes it
+  when it is within the threshold, over `iterations` rounds, then grain covers what is left, fading out
+  towards black and neutral chroma. Options, scales and defaults are mpv's (`iterations` 1, `threshold`
+  48, `range` 16, `grain` 32). `VideoDitherOptions.Algorithm.none` rounds instead of dithering, so the
+  pass can deband alone; `VideoDitherer` takes `deband` and `dither(_:debandRangeScale:)` keeps the
+  radius in source pixels for frames already scaled up. `aetherctl play --deband`. nil, the default,
+  is unchanged.
+
 ## [Unreleased]
 
 _Nothing yet._

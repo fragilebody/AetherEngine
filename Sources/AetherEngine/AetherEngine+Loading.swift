@@ -2044,6 +2044,7 @@ extension AetherEngine {
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.upscalePlan = upscaleRebuild.plan
         host.videoDither = loadedOptions.videoDither
+        host.videoDeband = loadedOptions.videoDeband
         host.elType = elType ?? sourceElType
         host.objectAudioRendering = loadedOptions.objectAudioRendering
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens

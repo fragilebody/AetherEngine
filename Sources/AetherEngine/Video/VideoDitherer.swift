@@ -12,6 +12,8 @@ public struct VideoDitherOptions: Sendable, Equatable {
         case fruit
         /// A 16x16 Bayer matrix: a regular cross-hatch, cheaper to build.
         case ordered
+        /// No dither, plain rounding to the output depth: for a pass that only debands.
+        case none
     }
 
     /// The bit depth the picture is dithered to, mpv's `--dither-depth`.
@@ -50,11 +52,36 @@ public struct VideoDitherOptions: Sendable, Equatable {
     }
 }
 
+/// How `VideoDitherer` (and `LoadOptions.videoDeband`) removes banding that is already in the video, after
+/// mpv's `--deband` options of the same names and with their defaults. Each iteration averages four samples
+/// at a random distance and angle, and a component that is within the threshold of that average takes it;
+/// grain then covers what is left.
+public struct VideoDebandOptions: Sendable, Equatable {
+    /// Rounds per pixel, each reaching further with a tighter threshold (`--deband-iterations`), 0 to 16.
+    /// Default 1. 0 adds grain only.
+    public var iterations: Int
+    /// How close a sample must be to the average to be replaced by it (`--deband-threshold`), 0 to 4096.
+    /// Default 48. Higher removes more banding and more fine detail.
+    public var threshold: Double
+    /// The first iteration's radius in source pixels (`--deband-range`), 1 to 64. Default 16.
+    public var range: Double
+    /// Noise added afterwards (`--deband-grain`), 0 to 4096. Default 32. Black and neutral chroma stay clean.
+    public var grain: Double
+
+    public init(iterations: Int = 1, threshold: Double = 48, range: Double = 16, grain: Double = 32) {
+        self.iterations = iterations
+        self.threshold = threshold
+        self.range = range
+        self.grain = grain
+    }
+}
+
 /// mpv's dither as one Metal pass: a decoded SDR frame (bi-planar Y'CbCr, 8 or 10 bit) is converted to
 /// R'G'B' at full precision and quantised to 8 or 10 bits through a threshold matrix tiled over the
-/// picture, so the rounding becomes fine noise instead of bands.
+/// picture, so the rounding becomes fine noise instead of bands. With `deband` the same pass first removes
+/// banding the encoder left in the frame, as mpv's `--deband` does, before the conversion.
 ///
-/// The engine runs it on the software path when `LoadOptions.videoDither` is set. A host that takes
+/// The engine runs it on the software path when `LoadOptions.videoDither` or `LoadOptions.videoDeband` is set. A host that takes
 /// AVPlayer's frames itself (an `AVPlayerItemVideoOutput`) can run the same pass on them; ask the output
 /// for `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` so the pass sees the source's full depth.
 ///
@@ -62,6 +89,8 @@ public struct VideoDitherOptions: Sendable, Equatable {
 public final class VideoDitherer: @unchecked Sendable {
 
     public let options: VideoDitherOptions
+    /// The deband stage in front of the dither; nil is none.
+    public let deband: VideoDebandOptions?
 
     /// The depth of the frames `dither(_:)` returns: 8 or 10.
     public var outputBits: Int { options.resolvedBits }
@@ -91,17 +120,18 @@ public final class VideoDitherer: @unchecked Sendable {
     private var failureNoted = false
 
     /// Nil without a Metal device, or when the pass cannot be compiled.
-    public convenience init?(options: VideoDitherOptions = VideoDitherOptions()) {
-        self.init(options: options, synchronousMatrix: false)
+    public convenience init?(options: VideoDitherOptions = VideoDitherOptions(), deband: VideoDebandOptions? = nil) {
+        self.init(options: options, deband: deband, synchronousMatrix: false)
     }
 
     /// `synchronousMatrix` builds a missing fruit matrix before returning (tests).
-    init?(options: VideoDitherOptions, synchronousMatrix: Bool) {
+    init?(options: VideoDitherOptions, deband: VideoDebandOptions? = nil, synchronousMatrix: Bool) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
               let cache else { return nil }
         self.options = options
+        self.deband = deband
         let bits = options.resolvedBits
 
         let descriptor = MTLRenderPipelineDescriptor()
@@ -116,8 +146,9 @@ public final class VideoDitherer: @unchecked Sendable {
             fruit = synchronousMatrix ? DitherMatrix.cachedFruit(sizeLog2: options.fruitSizeLog2)
                                       : DitherMatrix.builtFruit(sizeLog2: options.fruitSizeLog2)
         }
-        guard let first = Self.matrixTexture(fruit ?? DitherMatrix.bayer(size: DitherMatrix.orderedSize), device: device)
-        else { return nil }
+        // `.none` reads no matrix, but the shader still has one bound.
+        let values = options.algorithm == .none ? [0] : fruit ?? DitherMatrix.bayer(size: DitherMatrix.orderedSize)
+        guard let first = Self.matrixTexture(values, device: device) else { return nil }
 
         self.device = device
         self.queue = queue
@@ -157,7 +188,10 @@ public final class VideoDitherer: @unchecked Sendable {
     /// `buffer` dithered into a new RGB buffer of the same size (`outputPixelFormat`), carrying its colour
     /// tags, clean aperture and pixel aspect. Nil when the frame is not one this pass takes (HDR or Dolby
     /// Vision transfer, a format that is not 8 or 10 bit bi-planar Y'CbCr) or the GPU failed: show `buffer` then.
-    public func dither(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
+    ///
+    /// `debandRangeScale` multiplies the deband radius: a caller whose frames were scaled up from the source
+    /// passes the factor (frame height over source height) so the radius stays in source pixels.
+    public func dither(_ buffer: CVPixelBuffer, debandRangeScale: Double = 1) -> CVPixelBuffer? {
         guard let layout = Self.layout(of: CVPixelBufferGetPixelFormatType(buffer)), Self.isSDR(buffer) else { return nil }
         lock.lock(); defer { lock.unlock() }
         let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
@@ -170,10 +204,12 @@ public final class VideoDitherer: @unchecked Sendable {
         else { return failed("no buffer or texture for a \(width)x\(height) frame") }
 
         var params = Self.params(layout: layout, matrix: UpscaleMatrix.of(buffer), bits: outputBits,
-                                 matrixSize: matrixSize,
+                                 matrixSize: options.algorithm == .none ? 0 : matrixSize,
                                  chromaOffset: Self.chromaOffset(of: buffer, luma: (width, height),
                                                                  chroma: (chroma.texture.width, chroma.texture.height)),
-                                 phase: Self.phase(frame: frameIndex, options: options))
+                                 phase: Self.phase(frame: frameIndex, options: options),
+                                 deband: deband, debandRangeScale: debandRangeScale,
+                                 frameIndex: UInt32(truncatingIfNeeded: frameIndex))
         frameIndex &+= 1
 
         let pass = MTLRenderPassDescriptor()
@@ -200,12 +236,22 @@ public final class VideoDitherer: @unchecked Sendable {
         Self.carryAttachments(from: buffer, to: output)
         if !described {
             described = true
-            let matrixName = matrixIsFruit ? "fruit \(matrixSize)x\(matrixSize)"
-                : options.algorithm == .fruit ? "fruit (ordered until its matrix is built)" : "ordered \(matrixSize)x\(matrixSize)"
-            EngineLog.emit("[Dither] \(matrixName)\(options.temporal ? ", temporal" : "") to \(outputBits) bits, "
+            let matrixName = switch options.algorithm {
+            case .none: "no matrix (rounding)"
+            case .ordered: "ordered \(matrixSize)x\(matrixSize)"
+            case .fruit: matrixIsFruit ? "fruit \(matrixSize)x\(matrixSize)" : "fruit (ordered until its matrix is built)"
+            }
+            let temporal = options.temporal && options.algorithm != .none ? ", temporal" : ""
+            let debanded = deband.map { ", deband (iterations \($0.iterations), threshold \(Self.format($0.threshold)), "
+                + "range \(Self.format($0.range)), grain \(Self.format($0.grain)))" } ?? ""
+            EngineLog.emit("[Dither] \(matrixName)\(temporal)\(debanded) to \(outputBits) bits, "
                            + "from \(layout.bits)-bit \(width)x\(height)", category: .engine)
         }
         return output
+    }
+
+    private static func format(_ value: Double) -> String {
+        value.rounded() == value ? String(Int(value)) : String(value)
     }
 
     private func failed(_ reason: String) -> CVPixelBuffer? {
@@ -251,9 +297,10 @@ public final class VideoDitherer: @unchecked Sendable {
     }
 
     /// The shader's constants for one frame. A 10-bit plane holds its code in the high bits of 16, so a
-    /// sample of 1.0 is code 65535 / 64, not 1023.
+    /// sample of 1.0 is code 65535 / 64, not 1023. `matrixSize` 0 is no matrix (plain rounding).
     static func params(layout: Layout, matrix: UpscaleMatrix, bits: Int, matrixSize: Int,
-                       chromaOffset: SIMD2<Float>, phase: UInt32) -> DitherShaderParams {
+                       chromaOffset: SIMD2<Float>, phase: UInt32, deband: VideoDebandOptions? = nil,
+                       debandRangeScale: Double = 1, frameIndex: UInt32 = 0) -> DitherShaderParams {
         let codeScale: Float = layout.bits > 8 ? 65535.0 / 64.0 : 255.0
         let unit: Float = layout.bits > 8 ? 4 : 1
         let maxCode: Float = layout.bits > 8 ? 1023 : 255
@@ -269,12 +316,29 @@ public final class VideoDitherer: @unchecked Sendable {
             cScale = codeScale / maxCode
             cOffset = -128 * unit / maxCode
         }
+        // libplacebo takes the threshold and grain as fractions of the plane's code range (code / maxCode);
+        // here a unit of Y' is 219 codes (224 for chroma) in video range, so they are scaled to match.
+        let lumaUnit: Float = layout.videoRange ? maxCode / (219 * unit) : 1
+        let chromaUnit: Float = layout.videoRange ? maxCode / (224 * unit) : 1
+        var debandThreshold = SIMD2<Float>.zero, debandGrain = SIMD2<Float>.zero
+        var debandIterations: UInt32 = 0, debandRange: Float = 0
+        if let deband {
+            // mpv's option scales, as vo=gpu-next hands them to libplacebo (which divides by 1000 again).
+            let threshold = Float(min(max(deband.threshold, 0), 4096) / 16.384 / 1000)
+            let grain = Float(min(max(deband.grain, 0), 4096) / 8.192 / 1000)
+            debandThreshold = SIMD2(threshold * lumaUnit, threshold * chromaUnit)
+            debandGrain = SIMD2(grain * lumaUnit, grain * chromaUnit)
+            debandIterations = UInt32(min(max(deband.iterations, 0), 16))
+            debandRange = Float(min(max(deband.range, 1), 64) * max(debandRangeScale, 1))
+        }
         return DitherShaderParams(
             yScale: yScale, yOffset: yOffset, cScale: cScale, cOffset: cOffset,
             kr: matrix.kr, kb: matrix.kb,
             steps: Float((1 << (bits >= 10 ? 10 : 8)) - 1),
-            biasCentre: 0.5 / Float(matrixSize * matrixSize),
-            chromaOffset: chromaOffset, matrixSize: UInt32(matrixSize), phase: phase)
+            biasCentre: matrixSize > 0 ? 0.5 / Float(matrixSize * matrixSize) : 0.5,
+            chromaOffset: chromaOffset, debandThreshold: debandThreshold, debandGrain: debandGrain,
+            matrixSize: UInt32(matrixSize), phase: phase,
+            debandIterations: debandIterations, frameIndex: frameIndex, debandRange: debandRange)
     }
 
     /// Where the chroma samples sit, in chroma texels to add to a centred lookup. Untagged is left-sited,
@@ -294,7 +358,7 @@ public final class VideoDitherer: @unchecked Sendable {
 
     /// mpv's temporal dither: eight orientations of the matrix, one per `temporalPeriod` frames.
     static func phase(frame: Int, options: VideoDitherOptions) -> UInt32 {
-        guard options.temporal else { return 0 }
+        guard options.temporal, options.algorithm != .none else { return 0 }
         return UInt32((frame / max(1, options.temporalPeriod)) % 8)
     }
 

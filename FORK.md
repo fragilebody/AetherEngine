@@ -40,7 +40,7 @@ existing muxer tests).
 
 ## Based on
 
-Upstream tag `7.58.0`. Fork tag `7.58.0-memory.3`.
+Upstream tag `7.58.0`. Fork tag `7.58.0-memory.4`.
 
 ## Rebasing onto a new upstream tag
 
@@ -80,10 +80,15 @@ With the option set:
   route are skipped.
 - The native route is untouched. The host app's own compositor, which already takes AVPlayer's frames,
   calls `VideoDitherer` there.
+- Debanding (`LoadOptions.videoDeband`, `VideoDebandOptions`) is a stage of the same pass, before the
+  conversion: a port of libplacebo's `pl_shader_deband` (what mpv's `--deband` runs under `vo=gpu-next`),
+  with mpv's option names, scales and defaults and libplacebo's pcg3d hash. Alone it runs the pass with
+  `VideoDitherOptions.Algorithm.none` (plain rounding). `dither(_:debandRangeScale:)` keeps the radius in
+  source pixels after the upscale stage.
 - nil (the default) is upstream behaviour unchanged.
 
 Files touched: `PlayerState.swift`, `AetherEngine+Loading.swift`, `AetherEngine+ReloadWithOptions.swift`,
-`SoftwarePlaybackHost.swift`, `docs/api.md`, the new files above, and `aetherctl` (`play --dither`,
+`SoftwarePlaybackHost.swift`, `docs/api.md`, the new files above, and `aetherctl` (`play --dither`, `--deband`,
 `Sources/aetherctl/main.swift`, `PlaybackCmd.swift`, `docs/cli.md`); tests in
 `Tests/AetherEngineTests/VideoDitherTests.swift`.
 

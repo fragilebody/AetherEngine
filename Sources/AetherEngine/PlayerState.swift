@@ -569,6 +569,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change.
     public var videoDither: VideoDitherOptions? = nil
 
+    /// Remove banding that is already in SDR video on the software path, as mpv's `--deband` does
+    /// (`VideoDebandOptions`): it runs in the same pass as `videoDither`, on the Y'CbCr frame before the
+    /// conversion to R'G'B'. With `videoDither` nil the pass rounds instead of dithering, at 10 bits. nil
+    /// (the default) delivers frames as decoded. The same frames are left alone as for `videoDither`.
+    ///
+    /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change.
+    public var videoDeband: VideoDebandOptions? = nil
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -1152,6 +1160,7 @@ public struct LoadOptions: Sendable, Equatable {
         dualLayerRoute: DualLayerRoute = .softwareHost,
         upscalesLowResolutionVideo: Bool = false,
         videoDither: VideoDitherOptions? = nil,
+        videoDeband: VideoDebandOptions? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -1219,6 +1228,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.dualLayerRoute = dualLayerRoute
         self.upscalesLowResolutionVideo = upscalesLowResolutionVideo
         self.videoDither = videoDither
+        self.videoDeband = videoDeband
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel

@@ -79,6 +79,62 @@ struct VideoDitherOptionsTests {
         #expect(!SessionOptionCorrection.loadIdentityFields.contains("videoDither"))
     }
 
+    @Test func debandDefaultsAreMpvs() {
+        let options = VideoDebandOptions()
+        #expect(options.iterations == 1)
+        #expect(options.threshold == 48)
+        #expect(options.range == 16)
+        #expect(options.grain == 32)
+    }
+
+    @Test func debandLoadOptionIsOffByDefaultAndATuningField() {
+        #expect(LoadOptions().videoDeband == nil)
+        #expect(SessionOptionCorrection.knownFields.contains("videoDeband"))
+        #expect(!SessionOptionCorrection.loadIdentityFields.contains("videoDeband"))
+    }
+
+    /// The Swift struct is copied into the shader's constant buffer byte for byte.
+    @Test func shaderParamsLayoutMatchesTheShader() {
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.chromaOffset) == 32)
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.debandThreshold) == 40)
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.debandGrain) == 48)
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.matrixSize) == 56)
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.debandIterations) == 64)
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.debandRange) == 72)
+        #expect(MemoryLayout<DitherShaderParams>.stride == 80)
+    }
+
+    /// mpv's threshold 48 is 48 / 16384 of the code range, its grain 32 is 32 / 8192; here they are in units
+    /// of Y' (219 codes of 255 in video range) and chroma (224).
+    @Test func debandParamsUseMpvsScales() {
+        let p = VideoDitherer.params(layout: .init(bits: 10, videoRange: true), matrix: .bt709, bits: 10,
+                                     matrixSize: 64, chromaOffset: .zero, phase: 0, deband: VideoDebandOptions(),
+                                     debandRangeScale: 2, frameIndex: 7)
+        #expect(abs(p.debandThreshold.x - 48 / 16384 * 1023 / 876) < 1e-7)
+        #expect(abs(p.debandThreshold.y - 48 / 16384 * 1023 / 896) < 1e-7)
+        #expect(abs(p.debandGrain.x - 32 / 8192 * 1023 / 876) < 1e-7)
+        #expect(p.debandIterations == 1)
+        #expect(p.debandRange == 32)
+        #expect(p.frameIndex == 7)
+
+        let off = VideoDitherer.params(layout: .init(bits: 10, videoRange: true), matrix: .bt709, bits: 10,
+                                       matrixSize: 64, chromaOffset: .zero, phase: 0)
+        #expect(off.debandIterations == 0 && off.debandGrain == .zero && off.debandThreshold == .zero)
+        let shrunk = VideoDitherer.params(layout: .init(bits: 8, videoRange: false), matrix: .bt709, bits: 8,
+                                          matrixSize: 16, chromaOffset: .zero, phase: 0,
+                                          deband: VideoDebandOptions(iterations: 99, range: 16), debandRangeScale: 0.5)
+        #expect(shrunk.debandIterations == 16)
+        #expect(shrunk.debandRange == 16)
+    }
+
+    @Test func noAlgorithmMeansPlainRounding() {
+        let p = VideoDitherer.params(layout: .init(bits: 10, videoRange: true), matrix: .bt709, bits: 10,
+                                     matrixSize: 0, chromaOffset: .zero, phase: 0)
+        #expect(p.matrixSize == 0)
+        #expect(p.biasCentre == 0.5)
+        #expect(VideoDitherer.phase(frame: 3, options: VideoDitherOptions(algorithm: .none, temporal: true)) == 0)
+    }
+
     @Test func temporalPhaseCyclesThroughEightOrientations() {
         let off = VideoDitherOptions()
         #expect((0..<20).allSatisfy { VideoDitherer.phase(frame: $0, options: off) == 0 })
@@ -311,6 +367,113 @@ struct VideoDitherPassTests {
         let a = rgb(try #require(still.dither(source))).map(\.0)
         let b = rgb(try #require(still.dither(source))).map(\.0)
         #expect(a == b)
+    }
+
+    // MARK: Deband
+
+    /// Per-column mean of the red codes.
+    private func columnMeans(_ pixels: [(Int, Int, Int)], width: Int) -> [Double] {
+        let rows = pixels.count / width
+        return (0..<width).map { x in mean((0..<rows).map { pixels[$0 * width + x].0 }) }
+    }
+
+    /// Every channel of every pixel, in order, so two frames compare with `==`.
+    private func codes(_ pixels: [(Int, Int, Int)]) -> [Int] { pixels.flatMap { [$0.0, $0.1, $0.2] } }
+
+    private func largestStep(_ columns: [Double]) -> Double {
+        zip(columns, columns.dropFirst()).map { abs($1 - $0) }.max() ?? 0
+    }
+
+    /// Bands two codes apart, 32 pixels wide, as an encoder leaves them in a gradient: within the
+    /// threshold, so the deband pass spreads each step over its neighbourhood.
+    @Test func debandSmoothsAStaircase() throws {
+        let width = 256, height = 128
+        let source = try p010(width: width, height: height) { x, _ in (300 + (x / 32) * 2, 512, 512) }
+        let plain = try #require(VideoDitherer(options: VideoDitherOptions(), synchronousMatrix: true))
+        let deband = try #require(VideoDitherer(options: VideoDitherOptions(), deband: VideoDebandOptions(grain: 0),
+                                                synchronousMatrix: true))
+        let before = largestStep(columnMeans(rgb(try #require(plain.dither(source))), width: width))
+        let after = largestStep(columnMeans(rgb(try #require(deband.dither(source))), width: width))
+        #expect(before > 2, "the bands must show without deband (\(before))")
+        #expect(after < before * 0.5, "largest step between columns \(after) with deband, \(before) without")
+    }
+
+    /// An edge far above the threshold is real detail: it keeps its position and both levels.
+    @Test func debandKeepsAHardEdge() throws {
+        let width = 128, height = 128
+        let source = try p010(width: width, height: height) { x, _ in (x < 64 ? 200 : 700, 512, 512) }
+        let plain = try #require(VideoDitherer(options: VideoDitherOptions(), synchronousMatrix: true))
+        let reference = rgb(try #require(plain.dither(source)))
+        let clean = try #require(VideoDitherer(options: VideoDitherOptions(), deband: VideoDebandOptions(grain: 0),
+                                               synchronousMatrix: true))
+        #expect(codes(rgb(try #require(clean.dither(source)))) == codes(reference))
+
+        let grained = try #require(VideoDitherer(options: VideoDitherOptions(), deband: VideoDebandOptions(),
+                                                 synchronousMatrix: true))
+        let columns = columnMeans(rgb(try #require(grained.dither(source))), width: width)
+        let expected = columnMeans(reference, width: width)
+        for (x, (got, want)) in zip(columns, expected).enumerated() {
+            #expect(abs(got - want) < 1, "column \(x): \(got) vs \(want)")
+        }
+    }
+
+    @Test func debandWithNothingToDoIsThePassWithoutIt() throws {
+        let source = try p010(width: 128, height: 64) { x, y in (100 + x * 5, 400 + y, 620 - x) }
+        let plain = try #require(VideoDitherer(options: VideoDitherOptions(), synchronousMatrix: true))
+        let idle = try #require(VideoDitherer(options: VideoDitherOptions(),
+                                              deband: VideoDebandOptions(iterations: 0, grain: 0), synchronousMatrix: true))
+        #expect(codes(rgb(try #require(idle.dither(source)))) == codes(rgb(try #require(plain.dither(source)))))
+    }
+
+    @Test func grainLeavesBlackAndNeutralGreyAlone() throws {
+        let ditherer = try #require(VideoDitherer(options: VideoDitherOptions(), deband: VideoDebandOptions(grain: 128),
+                                                  synchronousMatrix: true))
+        let black = rgb(try #require(ditherer.dither(try p010(width: 64, height: 64) { _, _ in (64, 512, 512) })))
+        #expect(black.allSatisfy { $0 == (0, 0, 0) })
+
+        let grey = rgb(try #require(ditherer.dither(try p010(width: 128, height: 128) { _, _ in (500, 512, 512) })))
+        let reference = Double(500 - 64) / 876 * 1023
+        let channels = [grey.map(\.0), grey.map(\.1), grey.map(\.2)]
+        #expect(Set(channels[0]).count > 4, "grain must show")
+        for channel in channels {
+            #expect(abs(mean(channel) - reference) < 0.2, "mean \(mean(channel)) vs \(reference)")
+        }
+        #expect(abs(mean(channels[0]) - mean(channels[1])) < 0.02)
+        #expect(abs(mean(channels[2]) - mean(channels[1])) < 0.02)
+    }
+
+    /// The grain is seeded with the frame index, so it does not stand still as a fixed pattern, also
+    /// without temporal dithering.
+    @Test func grainChangesFromFrameToFrame() throws {
+        let ditherer = try #require(VideoDitherer(options: VideoDitherOptions(), deband: VideoDebandOptions(),
+                                                  synchronousMatrix: true))
+        let source = try p010(width: 64, height: 64) { _, _ in (500, 512, 512) }
+        let first = rgb(try #require(ditherer.dither(source))).map(\.0)
+        let second = rgb(try #require(ditherer.dither(source))).map(\.0)
+        #expect(first != second)
+    }
+
+    @Test(arguments: [8, 10])
+    func noAlgorithmRoundsToNearest(_ bits: Int) throws {
+        let ditherer = try #require(VideoDitherer(options: VideoDitherOptions(algorithm: .none, depth: .bits(bits)),
+                                                  synchronousMatrix: true))
+        let source = try p010(width: 64, height: 64) { _, _ in (500, 512, 512) }
+        let reference = Double(500 - 64) / 876 * Double((1 << bits) - 1)
+        let pixels = rgb(try #require(ditherer.dither(source)))
+        let expected = Int(reference.rounded())
+        #expect(pixels.allSatisfy { $0 == (expected, expected, expected) })
+    }
+
+    /// Debanding alone, as the software host builds it: no dither noise, but the bands still go.
+    @Test func debandWithoutDitherStillSmooths() throws {
+        let width = 256, height = 128
+        let source = try p010(width: width, height: height) { x, _ in (300 + (x / 32) * 2, 512, 512) }
+        let plain = try #require(VideoDitherer(options: VideoDitherOptions(algorithm: .none), synchronousMatrix: true))
+        let deband = try #require(VideoDitherer(options: VideoDitherOptions(algorithm: .none), deband: VideoDebandOptions(),
+                                                synchronousMatrix: true))
+        let before = largestStep(columnMeans(rgb(try #require(plain.dither(source))), width: width))
+        let after = largestStep(columnMeans(rgb(try #require(deband.dither(source))), width: width))
+        #expect(after < before * 0.5, "largest step between columns \(after) with deband, \(before) without")
     }
 
     // MARK: What it leaves alone

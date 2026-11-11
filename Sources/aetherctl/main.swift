@@ -843,6 +843,8 @@ if first == "play" {
     let playUpscale = takeFlag("--upscale", from: &rest)
     // `LoadOptions.videoDither` with its defaults (fruit matrix, 10 bits), off by default as in the engine.
     let playDither = takeFlag("--dither", from: &rest)
+    // `LoadOptions.videoDeband` with mpv's defaults, off by default as in the engine.
+    let playDeband = takeFlag("--deband", from: &rest)
     let playSurfaceFlag = takeFlag("--surface", from: &rest)
     let playWindowFlag = takeFlag("--window", from: &rest)
     let playAttachSurface = playSurfaceFlag || playWindowFlag
@@ -1184,6 +1186,7 @@ if first == "play" {
                  dualLayerRoute: playFelOutput ? .avPlayerOutput : .softwareHost,
                  upscalesLowResolutionVideo: playUpscale,
                  videoDither: playDither ? VideoDitherOptions() : nil,
+                 videoDeband: playDeband ? VideoDebandOptions() : nil,
                  attachSurface: playAttachSurface,
                  record: playRecord))
 }
