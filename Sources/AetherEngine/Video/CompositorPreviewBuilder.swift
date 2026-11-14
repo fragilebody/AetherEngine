@@ -36,7 +36,17 @@ enum CompositorPreviewBuilder {
     static func build(initData: Data, segmentURL: URL, durationSeconds: Double,
                       codecTagOverride: String?, colorOverride: MP4SegmentMuxer.ColorOverride?,
                       stagingDir: URL, content: Content = .firstKeyframe) -> Output? {
-        guard let segment = try? Data(contentsOf: segmentURL, options: .alwaysMapped) else { return nil }
+        build(initData: initData, segment: try? Data(contentsOf: segmentURL, options: .alwaysMapped),
+              durationSeconds: durationSeconds, codecTagOverride: codecTagOverride,
+              colorOverride: colorOverride, stagingDir: stagingDir, content: content)
+    }
+
+    /// Fork (memory-segments): the same, from the segment's bytes, which a segment held in memory
+    /// has instead of a file. nil `segment` (evicted, purged) builds nothing.
+    static func build(initData: Data, segment: Data?, durationSeconds: Double,
+                      codecTagOverride: String?, colorOverride: MP4SegmentMuxer.ColorOverride?,
+                      stagingDir: URL, content: Content = .firstKeyframe) -> Output? {
+        guard let segment else { return nil }
         let demuxer = Demuxer()
         defer { demuxer.close() }
         do {
@@ -116,7 +126,7 @@ enum CompositorPreviewBuilder {
             written += 1
         }
         guard written > 0, let firstDts, let firstFramePts,
-              case .completed(let path, _) = muxer.cutFragmentForNextSegment(1) else { return nil }
+              case .completed(.file(let path), _) = muxer.cutFragmentForNextSegment(1) else { return nil }
         completed = path
         guard let fragment = try? Data(contentsOf: path), !fragment.isEmpty, !initBytes.isEmpty else { return nil }
         let ticks = Double(video.timeBase.num) / Double(video.timeBase.den)

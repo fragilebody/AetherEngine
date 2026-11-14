@@ -143,7 +143,9 @@ final class MP4SegmentMuxer {
     /// success and failure: nothing was written, the muxer is intact, and the caller must retry the cut
     /// once an audio packet has been muxed. Collapsing it into nil (= failure) is what wedged AE#222.
     enum CutOutcome: Equatable {
-        case completed(path: URL, bytesWritten: Int)
+        /// Fork (memory-segments): the segment was staged in a file or, when the cache admitted it,
+        /// in a memory buffer.
+        case completed(staging: SegmentStaging, bytesWritten: Int)
         case deferredAwaitingAudioSampleEntry
         case failed
     }
@@ -175,10 +177,12 @@ final class MP4SegmentMuxer {
     private(set) var currentSegmentIndex: Int
     /// Same volume as cache adopt target so rename is metadata-only.
     private let sessionDir: URL
-    private var currentStagingPath: URL
-    /// The current segment's staging file. Only appended to, then renamed as it stands on adoption,
-    /// which is what lets progressive delivery read it while it is written.
-    var stagingURL: URL { currentStagingPath }
+    /// The current segment's staging file or memory buffer. Only appended to, then adopted as it
+    /// stands, which is what lets progressive delivery read it while it is written.
+    private(set) var currentStaging: SegmentStaging
+    /// Fork (memory-segments): asked for a memory buffer each time a segment opens; nil, or a nil
+    /// answer, stages the segment in a file as upstream does.
+    private let memoryStaging: ((Int) -> MemorySegmentBuffer?)?
     private var fd: Int32 = -1
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var pb: UnsafeMutablePointer<AVIOContext>?
@@ -318,9 +322,11 @@ final class MP4SegmentMuxer {
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
         onStorageExhausted: (@Sendable () -> Void)? = nil,
+        memoryStaging: ((Int) -> MemorySegmentBuffer?)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
+        self.memoryStaging = memoryStaging
         self.sessionDir = sessionDir
         self.haveAudio = audio != nil
         self.audioDelaySeconds = audioDelaySeconds
@@ -349,19 +355,25 @@ final class MP4SegmentMuxer {
 
         let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
                                          in: sessionDir)
-        self.currentStagingPath = firstPath
+        let firstMemory = memoryStaging?(initialSegmentIndex)
+        self.currentStaging = firstMemory.map { .memory($0) } ?? .file(firstPath)
         let firstFd: Int32
-        do {
-            firstFd = try Self.openPosix(path: firstPath)
-        } catch {
-            if Self.isOutOfSpace(error) { onStorageExhausted?() }
-            throw error
+        if firstMemory != nil {
+            firstFd = -1
+        } else {
+            do {
+                firstFd = try Self.openPosix(path: firstPath)
+            } catch {
+                if Self.isOutOfSpace(error) { onStorageExhausted?() }
+                throw error
+            }
         }
         self.fd = firstFd
 
         // Ref-typed counter shared with the splitter closure (closure can't capture self during init).
         let counter = ByteCounter()
         counter.fd = firstFd
+        counter.memory = firstMemory
         counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
@@ -390,7 +402,17 @@ final class MP4SegmentMuxer {
                 onInitCaptured(clean)
             },
             onFragmentBytes: { ptr, count in
-                guard !counter.writeFailed, counter.fd >= 0 else { return }
+                guard !counter.writeFailed else { return }
+                if let memory = counter.memory {
+                    guard memory.append(ptr, count: count) else {
+                        counter.writeFailed = true
+                        return
+                    }
+                    counter.bytesWrittenCurrentSegment += count
+                    counter.noteFragmentBytes(count)
+                    return
+                }
+                guard counter.fd >= 0 else { return }
                 var written = 0
                 while written < count {
                     let n = write(counter.fd, ptr.advanced(by: written), count - written)
@@ -415,11 +437,11 @@ final class MP4SegmentMuxer {
         var ctxOut: UnsafeMutablePointer<AVFormatContext>?
         let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "segment.m4s")
         guard allocRet == 0, let ctx = ctxOut else {
-            close(firstFd)
+            if firstFd >= 0 { close(firstFd) }
             // deinit runs for a throwing init once every stored property is set, and would close
             // this number a second time, by then possibly another socket's or file's.
             self.fd = -1
-            try? FileManager.default.removeItem(at: firstPath)
+            if firstFd >= 0 { try? FileManager.default.removeItem(at: firstPath) }
             throw MuxerError.allocFailed(code: allocRet)
         }
         self.formatContext = ctx
@@ -428,9 +450,9 @@ final class MP4SegmentMuxer {
         guard let pb = Self.allocAVIOContext(muxer: self) else {
             avformat_free_context(ctx)
             self.formatContext = nil
-            close(firstFd)
+            if firstFd >= 0 { close(firstFd) }
             self.fd = -1
-            try? FileManager.default.removeItem(at: firstPath)
+            if firstFd >= 0 { try? FileManager.default.removeItem(at: firstPath) }
             throw MuxerError.avioAllocFailed
         }
         self.pb = pb
@@ -832,7 +854,7 @@ final class MP4SegmentMuxer {
     /// rotation, so libavformat's interleaver RAM is released mid-segment; the first such flush also emits
     /// ftyp+moov under +delay_moov, populating init.mp4 early instead of only at the (far-off) first cut.
     private func flushPendingFragment() {
-        guard let ctx = formatContext, headerWritten, fd >= 0 else { return }
+        guard let ctx = formatContext, headerWritten, hasOutput else { return }
         // EAC3/AC-3/TrueHD moov-wedge guard (#92 follow-up): never let a video-only flush emit moov while
         // an audio stream whose sample entry needs a parsed packet is declared but no audio packet has been
         // written yet, mov_write_moov needs a parsed AC-3/E-AC-3/TrueHD packet for its dac3/dec3/dmlp box
@@ -859,7 +881,7 @@ final class MP4SegmentMuxer {
     /// signaling included); discarding its fragment keeps the delivered segment exactly as planned, with no
     /// out-of-place audio sample and no disjoint track ranges.
     private func primeMoovWithAudioFrame(_ frame: [UInt8]) {
-        guard let ctx = formatContext, headerWritten, fd >= 0, !frame.isEmpty, !moovFlushed else { return }
+        guard let ctx = formatContext, headerWritten, hasOutput, !frame.isEmpty, !moovFlushed else { return }
 
         // The prime is only safe if +frag_discont can be re-armed afterwards (see below), so prove that first:
         // the flag is still set at this point (movenc consumes it on the first packet written), which makes
@@ -929,6 +951,11 @@ final class MP4SegmentMuxer {
 
     /// Reset the current staging file to empty. Used after a moov prime, whose fragment must not be served.
     private func discardStagedFragmentBytes() {
+        if let memory = byteCounter.memory {
+            memory.truncate()
+            byteCounter.bytesWrittenCurrentSegment = 0
+            return
+        }
         guard fd >= 0 else { return }
         guard ftruncate(fd, 0) == 0, lseek(fd, 0, SEEK_SET) == 0 else {
             // Leaving primed bytes in front of the real fragment would serve a segment with an out-of-place
@@ -949,7 +976,7 @@ final class MP4SegmentMuxer {
     /// +delay_moov first-cut wrinkle: second av_write_frame(nil) (gated by moovFlushed) handles
     /// FFmpeg splitting ftyp+moov and moof+mdat across calls; safe no-op if both arrived in one call.
     func cutFragmentForNextSegment(_ nextIdx: Int) -> CutOutcome {
-        guard let ctx = formatContext, headerWritten, fd >= 0 else { return .failed }
+        guard let ctx = formatContext, headerWritten, hasOutput else { return .failed }
 
         // AE#222: the same precondition flushPendingFragment enforces. A first cut that would write moov for a
         // packet-derived audio sample entry with no audio packet muxed yet fails -22 inside mov_write_moov,
@@ -974,26 +1001,35 @@ final class MP4SegmentMuxer {
         segmentVideoStartPts = Int64.min
 
         // 2. Snapshot the completed segment + reset counters.
-        let completedPath = currentStagingPath
+        let completed = currentStaging
         let completedBytes = byteCounter.bytesWrittenCurrentSegment
         let completedFailed = byteCounter.writeFailed
-        close(fd)
+        if fd >= 0 { close(fd) }
         fd = -1
         byteCounter.fd = -1
+        byteCounter.memory = nil
         byteCounter.bytesWrittenCurrentSegment = 0
 
         if completedFailed || completedBytes == 0 {
-            try? FileManager.default.removeItem(at: completedPath)
+            if case .file(let completedPath) = completed {
+                try? FileManager.default.removeItem(at: completedPath)
+            }
             return .failed
         }
 
         byteCounter.noteFragmentCut()
 
+        if let memory = memoryStaging?(nextIdx) {
+            self.currentStaging = .memory(memory)
+            self.currentSegmentIndex = nextIdx
+            byteCounter.memory = memory
+            return .completed(staging: completed, bytesWritten: completedBytes)
+        }
         let nextPath = Self.stagingPath(forSegmentIndex: nextIdx, in: sessionDir)
         do {
             let nextFd = try Self.openPosix(path: nextPath)
             self.fd = nextFd
-            self.currentStagingPath = nextPath
+            self.currentStaging = .file(nextPath)
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
         } catch {
@@ -1004,15 +1040,15 @@ final class MP4SegmentMuxer {
                 category: .session
             )
             isWedged = true
-            return .completed(path: completedPath, bytesWritten: completedBytes)
+            return .completed(staging: completed, bytesWritten: completedBytes)
         }
 
-        return .completed(path: completedPath, bytesWritten: completedBytes)
+        return .completed(staging: completed, bytesWritten: completedBytes)
     }
 
     /// Final teardown: flush remaining packets, write trailer (mfra discarded by splitter), close fd.
     /// Returns the final segment's (path, bytes) for cache adoption, or nil on failure.
-    func finalize() -> (path: URL, bytesWritten: Int)? {
+    func finalize() -> (staging: SegmentStaging, bytesWritten: Int)? {
         defer { cleanup() }
 
         // AE#222: same precondition as the cut. A teardown flush on a muxer that never got an audio packet
@@ -1021,7 +1057,8 @@ final class MP4SegmentMuxer {
         guard let ctx = formatContext, headerWritten,
               !(audioNeedsParsedPacketForMoov && !audioPacketWritten && !moovFlushed) else {
             if fd >= 0 { close(fd); fd = -1 }
-            try? FileManager.default.removeItem(at: currentStagingPath)
+            byteCounter.memory = nil
+            if case .file(let path) = currentStaging { try? FileManager.default.removeItem(at: path) }
             return nil
         }
 
@@ -1032,7 +1069,7 @@ final class MP4SegmentMuxer {
         _ = av_write_frame(ctx, nil)
         _ = av_write_trailer(ctx)
 
-        let finalPath = currentStagingPath
+        let final = currentStaging
         let finalBytes = byteCounter.bytesWrittenCurrentSegment
         let finalFailed = byteCounter.writeFailed
 
@@ -1041,13 +1078,17 @@ final class MP4SegmentMuxer {
             fd = -1
             byteCounter.fd = -1
         }
+        byteCounter.memory = nil
 
         if finalFailed || finalBytes == 0 {
-            try? FileManager.default.removeItem(at: finalPath)
+            if case .file(let finalPath) = final { try? FileManager.default.removeItem(at: finalPath) }
             return nil
         }
-        return (path: finalPath, bytesWritten: finalBytes)
+        return (staging: final, bytesWritten: finalBytes)
     }
+
+    /// Whether a segment is open for writing: a staging file descriptor or a memory buffer.
+    private var hasOutput: Bool { fd >= 0 || byteCounter.memory != nil }
 
     // MARK: - Path helpers
 
@@ -1321,6 +1362,8 @@ final class MP4SegmentMuxer {
 /// (closures can't capture self during init).
 private final class ByteCounter {
     var fd: Int32 = -1
+    /// Fork (memory-segments): the memory buffer the current segment is written into, if any.
+    var memory: MemorySegmentBuffer?
     var bytesWrittenCurrentSegment: Int = 0
     var writeFailed: Bool = false
     /// Reports a staging write that hit a full volume to the session's cache.

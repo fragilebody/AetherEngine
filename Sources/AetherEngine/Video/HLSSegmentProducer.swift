@@ -2008,7 +2008,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // report can show the wedge and the recovery but not whether re-anchoring the
                     // producer could have helped at all, which is exactly what had to be inferred
                     // from two field logs.
-                    + "consumerTargetStored=\(cache.peekURL(index: cacheTarget) != nil ? "y" : "n") "
+                    + "consumerTargetStored=\(cache.hasSegment(index: cacheTarget) ? "y" : "n") "
                     + "highStored=\(cache.highestStoredIndex) cached=\(cache.count)"
                     + (wedgeDetector.lastTripFast ? " (fast path: fetch target + rendered clock both frozen)" : "")
                     + "; exiting pump for host re-anchor on AVPlayer position",
@@ -2281,6 +2281,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 audioDelaySeconds: audioDelaySeconds,
                 onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
+                // Fork (memory-segments): the cache decides per segment whether it fits in memory.
+                memoryStaging: cache.storesSegmentsInMemory
+                    ? { [cache] index in cache.admitMemorySegment(index: index) } : nil,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
@@ -2523,13 +2526,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
             bumpPacketsWritten()
         }
         switch muxer.cutFragmentForNextSegment(newIdx) {
-        case .completed(let path, let bytesWritten):
+        case .completed(let staging, let bytesWritten):
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s captured (\(bytesWritten) B)",
                 category: .session, level: .verbose
             )
             cache.adopt(index: currentMuxerSegmentIndex,
-                        stagingPath: path,
+                        staging: staging,
                         byteCount: bytesWritten,
                         videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex))
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
@@ -2763,7 +2766,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     private func noteSegmentInProgress(_ index: Int, muxer: MP4SegmentMuxer) {
         guard servesProgressively else { return }
-        cache.beginInProgress(index: index, stagingPath: muxer.stagingURL)
+        cache.beginInProgress(index: index, staging: muxer.currentStaging)
     }
 
     private func abandonSegmentInProgress(_ index: Int) {
@@ -2779,7 +2782,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 "[HLSSegmentProducer] seg-\(idx).m4s captured (\(result.bytesWritten) B)",
                 category: .session, level: .verbose
             )
-            cache.adopt(index: idx, stagingPath: result.path,
+            cache.adopt(index: idx, staging: result.staging,
                         byteCount: result.bytesWritten,
                         videoReach: takeVideoReach(forSegmentIndex: idx))
             if isLive {
@@ -2806,7 +2809,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // The partial segment is not adopted; a reader draining it is told before the file goes.
         abandonSegmentInProgress(idx)
         if let result = muxer.finalize() {
-            try? FileManager.default.removeItem(at: result.path)
+            if case .file(let path) = result.staging { try? FileManager.default.removeItem(at: path) }
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(idx).m4s partial at teardown (\(result.bytesWritten) B) discarded, not adopted",
                 category: .session

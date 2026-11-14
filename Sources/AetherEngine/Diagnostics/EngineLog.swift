@@ -63,6 +63,12 @@ public enum EngineLog {
         LogRedaction.redact(line)
     }
 
+    /// Fork: true when the `AETHER_LOG` environment variable is set to anything but "0".
+    public static let osLogEnabled: Bool = {
+        guard let value = ProcessInfo.processInfo.environment["AETHER_LOG"] else { return false }
+        return !value.isEmpty && value != "0"
+    }()
+
     public static let subsystem: String = "de.superuser404.AetherEngine"
 
     private static let loggers: [Category: Logger] = {
@@ -109,6 +115,15 @@ public enum EngineLog {
     /// `.public` privacy means a Console.app capture or a sysdiagnose would otherwise carry the token
     /// in clear text even for a host that scrubs its own log.
     private static func deliver(_ line: String, category: Category, level: Level) {
+        // Fork: OSLog output is off unless AETHER_LOG is set (any value but "0"), so the host's
+        // console stays quiet. Host handlers still receive `.info` lines either way.
+        guard osLogEnabled else {
+            guard level == .info, handler != nil || structuredHandler != nil else { return }
+            let line = LogRedaction.redact(line)
+            handler?(line)
+            structuredHandler?(line, category, level)
+            return
+        }
         switch level {
         case .info:
             let line = LogRedaction.redact(line)

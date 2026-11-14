@@ -8,6 +8,53 @@ Versioning follows [Semantic Versioning](https://semver.org). See
 [README › Stability and versioning](README.md#stability-and-versioning) for
 the public-API contract.
 
+## Fork: fragilebody/AetherEngine, branch `memory-segments`
+
+This fork is upstream plus a few changes, rebased onto each upstream tag it follows (see
+[FORK.md](FORK.md)). Fork tags are `<upstream tag>-memory.<n>`.
+
+### 7.58.0-memory.1 - 2026-11-05 (on upstream 7.58.0)
+
+- **Loopback segments can stay in RAM instead of being written to disk
+  (`LoadOptions.segmentMemoryBudgetBytes`).** On the native loopback route every remuxed HLS-fMP4
+  segment was written to a staging file under `aether-segments/` and served mmapped, so playback wrote
+  every byte watched to disk once (about 90 MB per minute at 12 Mbit/s). With a budget set, the muxer
+  writes each new segment into a purgeable memory buffer while the segments in memory fit the budget,
+  the cache adopts the buffer as it stands, and the loopback server serves it without a copy;
+  progressive delivery follows the growing buffer. A segment that would exceed the budget is written to
+  disk as before, and never moved between stores afterwards; later segments return to memory once
+  eviction frees room. Segments AVPlayer has not fetched yet are pinned; watched history is purgeable
+  and evicted farthest from the playhead first within the memory budget, and a segment macOS reclaimed
+  reads as missing and is produced again (the AE#451 path). nil, the default, keeps every segment on
+  disk exactly as upstream. VOD only.
+
+### 7.58.0-memory.3 - 2026-11-10 (on upstream 7.58.0)
+
+- **SDR video can be dithered the way mpv does it (`LoadOptions.videoDither`, `VideoDitherer`).**
+  Decoded Y'CbCr went to the display layer as it was and the system converted it to RGB, rounding
+  however it chose; a host that pulled AVPlayer's frames as 8-bit BGRA got 10-bit video rounded to
+  8 bits with nothing to hide the steps, which shows as bands in gradients. With the option set, the
+  software path converts each SDR frame to R'G'B' at full precision in one Metal pass and quantises it
+  through a threshold matrix tiled over the picture: mpv's blue-noise "fruit" matrix (a port of its
+  generator) or a Bayer matrix, optionally turned from frame to frame. The depth is 10 bits by default
+  (`.auto`, frames go out as 10-bit RGB) or 8. `VideoDitherer` is public, so a host that takes AVPlayer's
+  frames itself runs the same pass on the native route. HDR and Dolby Vision frames are never touched.
+  nil, the default, is upstream behaviour unchanged.
+
+### 7.58.0-memory.4 - 2026-11-10 (on upstream 7.58.0)
+
+- **Banding that is already in SDR video can be removed the way mpv's `--deband` does
+  (`LoadOptions.videoDeband`, `VideoDebandOptions`).** Dithering only hides the rounding the player
+  adds; bands the encoder left in the file stayed. The dither pass now has a deband stage in front of
+  the conversion to R'G'B', a port of libplacebo's `pl_shader_deband` (which mpv's `vo=gpu-next` runs):
+  each pixel is compared with the average of four samples at a random distance and angle and takes it
+  when it is within the threshold, over `iterations` rounds, then grain covers what is left, fading out
+  towards black and neutral chroma. Options, scales and defaults are mpv's (`iterations` 1, `threshold`
+  48, `range` 16, `grain` 32). `VideoDitherOptions.Algorithm.none` rounds instead of dithering, so the
+  pass can deband alone; `VideoDitherer` takes `deband` and `dither(_:debandRangeScale:)` keeps the
+  radius in source pixels for frames already scaled up. `aetherctl play --deband`. nil, the default,
+  is unchanged.
+
 ## [Unreleased]
 
 ### Fixed

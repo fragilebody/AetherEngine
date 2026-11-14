@@ -920,6 +920,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `LoadOptions.progressiveSegmentDelivery`, handed to the provider and to every producer this
     /// session builds. Set before `start()`.
     var servesSegmentsProgressively = false
+    /// Fork (memory-segments): `LoadOptions.segmentMemoryBudgetBytes`, set before `start()`. VOD only.
+    var segmentMemoryBudgetBytes: Int?
 
     /// Serializes restart requests among themselves. Held across waits (unlike `restartLock`);
     /// only other restarts contend on it.
@@ -1832,12 +1834,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let budget = resolvedBudget ?? Self.resolveSessionCacheBudget(
             requestedBytes: nil, volumeAvailableBytes: availableBytes, capRelaxed: capRelaxed)
         let retentionBudget = claim.bytes
+        let memoryBudget = isLiveSession ? nil : segmentMemoryBudgetBytes.map { max(0, $0) }
         let segmentCache = SegmentCache(
             forwardWindow: forwardWindowSegments,
             retentionBudgetBytes: retentionBudget,
             nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
+            memoryBudgetBytes: memoryBudget,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
         )
+        if let memoryBudget {
+            EngineLog.emit("[HLSVideoEngine] segment memory budget: \(memoryBudget / (1 << 20)) MiB "
+                           + "(segments above it spill to disk)", category: .session)
+        }
         claim.track { [weak segmentCache] in segmentCache?.totalBytes ?? 0 }
         restartLock.lock()
         self.retentionBudgetBytes = retentionBudget
@@ -3058,10 +3066,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let carriedOffset: Double?
         let identity: String
         let initData: Data
-        let segmentURL: URL
+        /// The segment file, or nil when the segment is held in memory (fork: memory-segments).
+        let segmentURL: URL?
+        /// Fork (memory-segments): the segment's memory buffer, pinned only while a reader reads it.
+        var segmentBuffer: MemorySegmentBuffer? = nil
+
+        /// The segment's bytes: mapped from its file, or over its memory buffer without a copy.
+        /// nil once the segment was evicted or purged.
+        func segmentBytes() -> Data? {
+            if let segmentBuffer { return segmentBuffer.pinnedData() }
+            guard let segmentURL else { return nil }
+            return try? Data(contentsOf: segmentURL, options: .alwaysMapped)
+        }
 
         func makeReader() -> DataIOReader? {
-            guard let segment = try? Data(contentsOf: segmentURL, options: .alwaysMapped) else { return nil }
+            guard let segment = segmentBytes() else { return nil }
             return DataIOReader(parts: [initData, segment])
         }
     }
@@ -3076,9 +3095,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         anchorShiftLock.lock()
         let carried = isLiveSession ? 0 : epochAxisByIndex.carried(at: seg.index)
         anchorShiftLock.unlock()
+        let fileURL: URL
+        switch seg.storage {
+        case .memory(let buffer):
+            // A memory buffer is never rewritten either; its process-unique id names its bytes.
+            let identity = "mem:\(buffer.id):\(buffer.length):" + initData.base64EncodedString()
+            return ScrubThumbnailSource(segmentIndex: seg.index, startSeconds: seg.startSeconds,
+                                        durationSeconds: seg.durationSeconds, carriedOffset: carried,
+                                        identity: identity, initData: initData, segmentURL: nil,
+                                        segmentBuffer: buffer)
+        case .file(let url):
+            fileURL = url
+        }
         // The cache replaces/unlinks immutable files. An index alone cannot
         // identify bytes after a same-session re-cut/restart rewrites that index.
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: seg.fileURL.path),
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
               let volume = attributes[.systemNumber] as? NSNumber,
               let inode = attributes[.systemFileNumber] as? NSNumber,
               let size = attributes[.size] as? NSNumber,
@@ -3086,7 +3117,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let identity = "\(volume.uint64Value):\(inode.uint64Value):\(size.uint64Value):\(modified.timeIntervalSince1970):" + initData.base64EncodedString()
         return ScrubThumbnailSource(segmentIndex: seg.index, startSeconds: seg.startSeconds, durationSeconds: seg.durationSeconds,
                                     carriedOffset: carried, identity: identity,
-                                    initData: initData, segmentURL: seg.fileURL)
+                                    initData: initData, segmentURL: fileURL)
     }
 
     struct CompositorPreviewFile: Sendable {
@@ -3129,7 +3160,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let staging = directory.appendingPathComponent("staging", isDirectory: true)
         guard (try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)) != nil,
               let built = CompositorPreviewBuilder.build(
-                initData: source.initData, segmentURL: source.segmentURL,
+                initData: source.initData, segment: source.segmentBytes(),
                 durationSeconds: source.durationSeconds, codecTagOverride: tag, colorOverride: color,
                 stagingDir: staging) else { return nil }
         let url = directory.appendingPathComponent("seg\(source.segmentIndex)-\(serial).mp4")
@@ -3442,7 +3473,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let staging = directory.appendingPathComponent("hold-staging", isDirectory: true)
         guard (try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)) != nil,
               let built = CompositorPreviewBuilder.build(
-                initData: source.initData, segmentURL: source.segmentURL,
+                initData: source.initData, segment: source.segmentBytes(),
                 durationSeconds: source.durationSeconds, codecTagOverride: tag, colorOverride: color,
                 stagingDir: staging, content: .wholeSegment) else { return nil }
         compositorPreviewLock.lock()

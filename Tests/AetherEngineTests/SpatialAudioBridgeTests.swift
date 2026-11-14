@@ -514,7 +514,7 @@ struct SpatialAudioBridgeTests {
                 #expect(muxer.writePacket(fp).rc >= 0)
             }
         }
-        guard case .completed(let segment, _) = muxer.cutFragmentForNextSegment(1) else {
+        guard case .completed(.file(let segment), _) = muxer.cutFragmentForNextSegment(1) else {
             Issue.record("the stand-in needs no parsed packet, so the cut completes")
             return nil
         }

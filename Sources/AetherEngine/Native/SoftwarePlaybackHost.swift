@@ -220,6 +220,15 @@ final class SoftwarePlaybackHost {
     /// Typed loosely because the class does not exist in simulator builds or before OS 26.
     private(set) var frameUpscaler: AnyObject?
 
+    /// `LoadOptions.videoDither`, set by the load before `load(demuxer:...)`; non-nil dithers every SDR frame.
+    var videoDither: VideoDitherOptions?
+
+    /// `LoadOptions.videoDeband`, set with `videoDither`; non-nil debands every SDR frame.
+    var videoDeband: VideoDebandOptions?
+
+    /// The pass built for `videoDither` and `videoDeband`, nil when none was.
+    private(set) var frameDitherer: VideoDitherer?
+
     /// Forwarded Dolby Vision profile number (e.g. 7, 8) if detected from bitstream or container
     var configuredDVProfile: Int?
 
@@ -1219,6 +1228,31 @@ final class SoftwarePlaybackHost {
         return handler
     }
 
+    /// `handler` behind the dither pass when `videoDither` or `videoDeband` is set and the pass builds, else
+    /// unchanged. It runs last, on the frame the display layer gets (after the upscale stage). Never for the
+    /// dual-layer decoder, whose frames are HDR; the pass itself returns HDR frames untouched.
+    func ditheredFrameHandler(
+        _ handler: @escaping DecodedFrameHandler,
+        decoder: any VideoDecodingPipeline
+    ) -> DecodedFrameHandler {
+        frameDitherer = nil
+        guard videoDither != nil || videoDeband != nil, !Self.isDualLayer(decoder) else { return handler }
+        // Deband alone rounds at the default depth instead of dithering.
+        let options = videoDither ?? VideoDitherOptions(algorithm: .none)
+        guard let stage = VideoDitherer(options: options, deband: videoDeband) else {
+            EngineLog.emit("[Dither] not built: no Metal device, frames are delivered as decoded", category: .swPlayback)
+            return handler
+        }
+        frameDitherer = stage
+        // Frames the upscale stage enlarged keep the deband radius in source pixels.
+        let sourceHeight = upscalePlan?.sourceHeight ?? 0
+        return DitheringFrameHandler.wrap(handler) { buffer in
+            let height = CVPixelBufferGetHeight(buffer)
+            let scale = sourceHeight > 0 ? max(1, Double(height) / Double(sourceHeight)) : 1
+            return stage.dither(buffer, debandRangeScale: scale)
+        }
+    }
+
     // MARK: - Load
 
     func load(
@@ -1454,8 +1488,10 @@ final class SoftwarePlaybackHost {
             }
         }
 
+        // Innermost wraps last: a frame is upscaled first, then dithered, then enqueued.
         let onFrame = upscaledFrameHandler(
-            baseOnFrame, decoder: videoDecoder, frameRate: AetherEngine.detectFrameRate(stream: vStream))
+            ditheredFrameHandler(baseOnFrame, decoder: videoDecoder),
+            decoder: videoDecoder, frameRate: AetherEngine.detectFrameRate(stream: vStream))
 
         if vStream.pointee.codecpar?.pointee.codec_id == AV_CODEC_ID_VP9 {
             let opened = try VideoDecoderOpener.openPreferredOrFallback(

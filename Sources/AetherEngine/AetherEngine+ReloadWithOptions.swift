@@ -485,7 +485,7 @@ enum SessionOptionCorrection {
     static let knownFields: [String] = [
         "sourceDiagnosticsContext",
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "displayCriteriaOwner", "httpHeaders", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "dualLayerRoute", "upscalesLowResolutionVideo", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "dualLayerRoute", "upscalesLowResolutionVideo", "videoDither", "videoDeband", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "stereoPresentation", "isLive", "audioOnly",
         "dvrWindowSeconds",
@@ -495,7 +495,7 @@ enum SessionOptionCorrection {
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "generatesBackgroundScrubPreviews", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "skipsContainerAttachments", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
+        "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "segmentMemoryBudgetBytes", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
         "audioDelaySeconds", "audioShaping", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
         "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]

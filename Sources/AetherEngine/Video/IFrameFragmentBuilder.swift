@@ -50,7 +50,7 @@ final class IFrameFragmentBuilder {
         av_packet_rescale_ts(packet, video.timeBase, muxer.muxerVideoTimeBase)
 
         guard muxer.writePacket(packet).rc >= 0,
-              case .completed(let path, _) = muxer.cutFragmentForNextSegment(index + 1) else { return nil }
+              case .completed(.file(let path), _) = muxer.cutFragmentForNextSegment(index + 1) else { return nil }
         completed = path
         guard let fragment = try? Data(contentsOf: path), !fragment.isEmpty, !initBytes.isEmpty else {
             return nil

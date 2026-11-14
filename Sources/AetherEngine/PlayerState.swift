@@ -559,6 +559,24 @@ public struct LoadOptions: Sendable, Equatable {
     /// in place, and turning it on is refused with `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`.
     public var upscalesLowResolutionVideo: Bool = false
 
+    /// Dither SDR video on the software path, as mpv does: each decoded frame is converted to R'G'B' at
+    /// full precision and quantised to 8 or 10 bits through a threshold matrix (`VideoDitherer`), so the
+    /// rounding of the conversion shows as fine noise instead of bands. nil (the default) delivers frames
+    /// as decoded. HDR and Dolby Vision frames, and the dual-layer route, are never dithered. The native
+    /// AVPlayer route is not touched: the engine does not see its frames, and a host that takes them
+    /// itself runs `VideoDitherer` on them.
+    ///
+    /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change.
+    public var videoDither: VideoDitherOptions? = nil
+
+    /// Remove banding that is already in SDR video on the software path, as mpv's `--deband` does
+    /// (`VideoDebandOptions`): it runs in the same pass as `videoDither`, on the Y'CbCr frame before the
+    /// conversion to R'G'B'. With `videoDither` nil the pass rounds instead of dithering, at 10 bits. nil
+    /// (the default) delivers frames as decoded. The same frames are left alone as for `videoDither`.
+    ///
+    /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change.
+    public var videoDeband: VideoDebandOptions? = nil
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -1008,6 +1026,16 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Optional temporary session-cache budget. Nil retains automatic sizing; zero keeps only the working window.
     public var sessionCacheByteBudget: Int? = nil
+
+    /// Fork (memory-segments): byte budget for loopback VOD segments held in RAM instead of on disk.
+    /// While the segments in memory fit it, the muxer writes each new segment into a purgeable memory
+    /// buffer and the loopback server serves it from there, so nothing is written to disk; a segment
+    /// that would exceed it is written to disk as without this option, and later segments return to
+    /// memory once eviction frees room. Watched history is purgeable, so macOS may reclaim it under
+    /// memory pressure (a reclaimed segment is produced again if it is asked for). Counted apart from
+    /// `sessionCacheByteBudget`, which keeps bounding the disk. nil (the default) keeps every segment on
+    /// disk. VOD only; ignored on live, `nativeRemoteHLS` and the software path.
+    public var segmentMemoryBudgetBytes: Int? = nil
     /// Compressed-packet storage for seekable software VOD; automatic retains platform defaults.
     public var softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic
 
@@ -1131,6 +1159,8 @@ public struct LoadOptions: Sendable, Equatable {
         preferDualLayerDolbyVision: Bool = false,
         dualLayerRoute: DualLayerRoute = .softwareHost,
         upscalesLowResolutionVideo: Bool = false,
+        videoDither: VideoDitherOptions? = nil,
+        videoDeband: VideoDebandOptions? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -1171,6 +1201,7 @@ public struct LoadOptions: Sendable, Equatable {
         initialSubtitleTrackID: Int? = nil,
         forwardBufferSegments: Int? = nil,
         sessionCacheByteBudget: Int? = nil,
+        segmentMemoryBudgetBytes: Int? = nil,
         softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic,
         progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
@@ -1196,6 +1227,8 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
         self.dualLayerRoute = dualLayerRoute
         self.upscalesLowResolutionVideo = upscalesLowResolutionVideo
+        self.videoDither = videoDither
+        self.videoDeband = videoDeband
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
@@ -1236,6 +1269,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.initialSubtitleTrackID = initialSubtitleTrackID
         self.forwardBufferSegments = forwardBufferSegments
         self.sessionCacheByteBudget = sessionCacheByteBudget
+        self.segmentMemoryBudgetBytes = segmentMemoryBudgetBytes
         self.softwarePacketCacheStorage = softwarePacketCacheStorage
         self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay

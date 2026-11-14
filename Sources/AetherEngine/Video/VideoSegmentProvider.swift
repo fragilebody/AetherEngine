@@ -1622,13 +1622,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Pure lookup for a scrub thumbnail: no side effects, no restarts; nil outside the
     /// resident window or on a cache miss. Works for live and VOD (VOD `segments` carry
     /// `startSeconds` from init); callers gate on session type one layer up.
-    func thumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, durationSeconds: Double, fileURL: URL)? {
+    /// Fork (memory-segments): `storage` is the segment's file or its memory buffer.
+    func thumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, durationSeconds: Double, storage: SegmentStorage)? {
         stateLock.lock()
         let segs = segments
         stateLock.unlock()
         guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segs) else { return nil }
-        guard let url = cache.peekURL(index: idx) else { return nil }
-        return (idx, segs[idx].startSeconds, segs[idx].durationSeconds, url)
+        guard let storage = cache.peekStorage(index: idx) else { return nil }
+        return (idx, segs[idx].startSeconds, segs[idx].durationSeconds, storage)
     }
 
     /// AE#441: the oldest position a rewind can actually land on and still play forward, in output
@@ -1742,7 +1743,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// already stored is not starved, and re-anchoring throws away the pump's forward work to
     /// rebuild what it already has.
     func hasStoredSegment(at index: Int) -> Bool {
-        return cache.peekURL(index: index) != nil
+        return cache.hasSegment(index: index)
     }
 
     /// What to do with a request for a non-resident index, given how often pumps have folded it (#358).
@@ -1818,7 +1819,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // open the index, because the boundaries move with the producer's base, so the first fold
         // asks for exactly that. A second fold is that repair reproducing its own trigger, and then
         // the source has no way past this point.
-        if !isLive, cache.peekURL(index: index) == nil {
+        if !isLive, !cache.hasSegment(index: index) {
             let folds = cache.foldCount(index)
             switch VideoSegmentProvider.foldedTargetDecision(
                 folds: folds, alreadyReanchoredHere: lastRestartIndex == index
@@ -1850,7 +1851,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         if previousTarget >= 0, index < previousTarget - 2, let restart = restartHandler {
             // Cache gate: backwardWindow=20 covers Continuous-Audio handover refetches (~7-10 segments
             // backward); unconditional proactive restart re-armed the FLAC bridge and caused audible glitches.
-            if cache.peekURL(index: index) != nil {
+            if cache.hasSegment(index: index) {
                 // A sequential origin has no restart to offer (its pump can only read from byte 0)
                 // and keeps every segment it cut, so a resident target is served from the cache.
                 // The contiguity scan below would read the plan indices its cutter left as holes
