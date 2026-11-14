@@ -55,6 +55,19 @@ This fork is upstream plus a few changes, rebased onto each upstream tag it foll
   radius in source pixels for frames already scaled up. `aetherctl play --deband`. nil, the default,
   is unchanged.
 
+### 7.58.2 - 2026-11-14 (on upstream 7.58.0)
+
+- **The dither pass can blend an overlay before it quantises (`VideoDitherOverlay`,
+  `VideoDitherer.dither(_:debandRangeScale:overlay:)`).** A host that takes AVPlayer's frames and burns
+  subtitles into them ran two full-frame passes per frame: the dither pass into one buffer, then its
+  own blend into another, each with a commit and a wait, and the subtitle went on after the rounding,
+  so its soft edges were never dithered. The pass now takes a premultiplied RGBA texture with the rect
+  of the frame it covers and blends it over the R'G'B' picture before the dither. The host's closure
+  is handed the frame's command buffer and can draw the texture there, so the frame costs one buffer,
+  one commit and one wait. `init?(options:deband:device:)` takes the Metal device the host's textures
+  are on, `device` exposes it, and `lastGPUSeconds` is the GPU time of the last frame. No overlay, the
+  default, is the pass as it was.
+
 ## [Unreleased]
 
 ### Fixed

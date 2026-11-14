@@ -101,7 +101,10 @@ struct VideoDitherOptionsTests {
         #expect(MemoryLayout<DitherShaderParams>.offset(of: \.matrixSize) == 56)
         #expect(MemoryLayout<DitherShaderParams>.offset(of: \.debandIterations) == 64)
         #expect(MemoryLayout<DitherShaderParams>.offset(of: \.debandRange) == 72)
-        #expect(MemoryLayout<DitherShaderParams>.stride == 80)
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.overlayRect) == 80)
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.overlayUVScale) == 96)
+        #expect(MemoryLayout<DitherShaderParams>.offset(of: \.overlayEnabled) == 104)
+        #expect(MemoryLayout<DitherShaderParams>.stride == 112)
     }
 
     /// mpv's threshold 48 is 48 / 16384 of the code range, its grain 32 is 32 / 8192; here they are in units
@@ -515,6 +518,103 @@ struct VideoDitherPassTests {
         let reds = rgb(try #require(ditherer.dither(source))).map(\.0)
         #expect(Set(reds) == [126, 127])
         #expect(abs(mean(reds) - 126.917) < 0.01)
+    }
+
+    // MARK: Overlay
+
+    /// A `width`x`height` RGBA texture on `device`; `pixel` gives premultiplied (R, G, B, A) bytes.
+    private func overlayTexture(_ device: MTLDevice, width: Int, height: Int,
+                                _ pixel: (Int, Int) -> (UInt8, UInt8, UInt8, UInt8)) throws -> MTLTexture {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
+        descriptor.usage = [.shaderRead]
+        let texture = try #require(device.makeTexture(descriptor: descriptor))
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(width * height * 4)
+        for y in 0..<height { for x in 0..<width { let p = pixel(x, y); bytes += [p.0, p.1, p.2, p.3] } }
+        texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: bytes, bytesPerRow: width * 4)
+        return texture
+    }
+
+    private func same(_ a: [(Int, Int, Int)], _ b: [(Int, Int, Int)]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { $0 == $1 }
+    }
+
+    /// An opaque overlay replaces the picture inside its rect, exactly, and nowhere else. Only the part of
+    /// the texture `uvScale` names is shown (the rest of this one is blue).
+    @Test(arguments: [8, 10])
+    func opaqueOverlayReplacesThePictureInsideItsRect(_ bits: Int) throws {
+        let ditherer = try #require(VideoDitherer(options: VideoDitherOptions(algorithm: .ordered, depth: .bits(bits))))
+        let source = try p010(width: 64, height: 64) { _, _ in (500, 512, 512) }
+        let plain = rgb(try #require(ditherer.dither(source)))
+        let texture = try overlayTexture(ditherer.device, width: 32, height: 32) { x, y in
+            x < 16 && y < 16 ? (255, 0, 0, 255) : (0, 0, 255, 255)
+        }
+        let rect = CGRect(x: 8, y: 24, width: 16, height: 16)
+        let output = rgb(try #require(ditherer.dither(source) { _ in
+            VideoDitherOverlay(texture: texture, frameRect: rect, uvScale: SIMD2(0.5, 0.5))
+        }))
+        let top = (1 << bits) - 1
+        for y in 0..<64 {
+            for x in 0..<64 {
+                let pixel = output[y * 64 + x]
+                if rect.contains(CGPoint(x: Double(x) + 0.5, y: Double(y) + 0.5)) {
+                    #expect(pixel == (top, 0, 0), "(\(x), \(y)) is \(pixel)")
+                } else {
+                    #expect(pixel == plain[y * 64 + x], "(\(x), \(y)) is \(pixel)")
+                }
+            }
+        }
+    }
+
+    /// Half-transparent grey over grey lands between two codes, and the dither holds that level on average:
+    /// the overlay is blended before the picture is quantised, not after.
+    @Test func translucentOverlayIsDitheredWithThePicture() throws {
+        let ditherer = try #require(VideoDitherer(options: VideoDitherOptions(algorithm: .fruit, depth: .bits(10)), synchronousMatrix: true))
+        let source = try p010(width: 128, height: 128) { _, _ in (500, 512, 512) }
+        let texture = try overlayTexture(ditherer.device, width: 4, height: 4) { _, _ in (64, 64, 64, 128) }
+        let output = rgb(try #require(ditherer.dither(source) { _ in
+            VideoDitherOverlay(texture: texture, frameRect: CGRect(x: 0, y: 0, width: 128, height: 128))
+        }))
+        let picture = Double(500 - 64) / 876
+        let reference = (64.0 / 255 + picture * (1 - 128.0 / 255)) * 1023
+        #expect(abs(reference.rounded() - reference) > 0.05, "the level must sit between codes for this to test anything")
+        for channel in [output.map(\.0), output.map(\.1), output.map(\.2)] {
+            #expect(abs(mean(channel) - reference) < 0.01, "mean \(mean(channel)) vs \(reference)")
+            #expect(Set(channel) == [Int(reference.rounded(.down)), Int(reference.rounded(.up))])
+        }
+    }
+
+    /// No overlay from the closure, or an empty rect, is the pass without one.
+    @Test func noOverlayIsThePassWithoutOne() throws {
+        let ditherer = try #require(VideoDitherer(options: VideoDitherOptions(algorithm: .ordered, depth: .bits(10))))
+        let source = try p010(width: 64, height: 64) { x, y in (64 + x * 10 + y, 512, 512) }
+        let plain = rgb(try #require(ditherer.dither(source)))
+        #expect(same(rgb(try #require(ditherer.dither(source) { _ in nil })), plain))
+        let texture = try overlayTexture(ditherer.device, width: 4, height: 4) { _, _ in (255, 255, 255, 255) }
+        #expect(same(rgb(try #require(ditherer.dither(source) { _ in
+            VideoDitherOverlay(texture: texture, frameRect: CGRect(x: 10, y: 10, width: 0, height: 20))
+        })), plain))
+    }
+
+    /// What the closure encodes into the frame's command buffer runs before the dither pass reads the texture.
+    @Test func overlayDrawnInTheFramesCommandBufferIsSeen() throws {
+        let ditherer = try #require(VideoDitherer(options: VideoDitherOptions(algorithm: .ordered, depth: .bits(10))))
+        let source = try p010(width: 32, height: 32) { _, _ in (500, 512, 512) }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 8, height: 8, mipmapped: false)
+        descriptor.usage = [.shaderRead, .renderTarget]
+        descriptor.storageMode = .private
+        let texture = try #require(ditherer.device.makeTexture(descriptor: descriptor))
+        let output = rgb(try #require(ditherer.dither(source) { commands in
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = texture
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 1, blue: 0, alpha: 1)
+            pass.colorAttachments[0].storeAction = .store
+            commands.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+            return VideoDitherOverlay(texture: texture, frameRect: CGRect(x: 0, y: 0, width: 32, height: 32))
+        }))
+        #expect(output.allSatisfy { $0 == (0, 1023, 0) })
+        #expect(ditherer.lastGPUSeconds > 0)
     }
 
     @Test func untaggedInputIsTaggedBT709() throws {

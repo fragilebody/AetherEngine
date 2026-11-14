@@ -76,6 +76,23 @@ public struct VideoDebandOptions: Sendable, Equatable {
     }
 }
 
+/// A picture `VideoDitherer` blends over a frame before it dithers: a subtitle, say. The pass knows
+/// nothing about what it shows.
+public struct VideoDitherOverlay {
+    /// Premultiplied RGBA, on the ditherer's `device`.
+    public var texture: MTLTexture
+    /// Where the picture goes on the frame, in frame pixels from the top-left corner. It is scaled to fit.
+    public var frameRect: CGRect
+    /// The part of `texture` the picture covers, from its top-left corner (1, 1 is all of it).
+    public var uvScale: SIMD2<Float>
+
+    public init(texture: MTLTexture, frameRect: CGRect, uvScale: SIMD2<Float> = SIMD2(1, 1)) {
+        self.texture = texture
+        self.frameRect = frameRect
+        self.uvScale = uvScale
+    }
+}
+
 /// mpv's dither as one Metal pass: a decoded SDR frame (bi-planar Y'CbCr, 8 or 10 bit) is converted to
 /// R'G'B' at full precision and quantised to 8 or 10 bits through a threshold matrix tiled over the
 /// picture, so the rounding becomes fine noise instead of bands. With `deband` the same pass first removes
@@ -103,7 +120,13 @@ public final class VideoDitherer: @unchecked Sendable {
         bits >= 10 ? kCVPixelFormatType_ARGB2101010LEPacked : kCVPixelFormatType_32BGRA
     }
 
-    private let device: MTLDevice
+    /// The device the pass runs on; an overlay's texture must be made on it.
+    public let device: MTLDevice
+    /// GPU time of the last frame's command buffer, in seconds (0 before the first).
+    public var lastGPUSeconds: Double { lock.lock(); defer { lock.unlock() }; return _lastGPUSeconds }
+    private var _lastGPUSeconds = 0.0
+    /// Bound when a frame has no overlay: the shader always has one.
+    private let noOverlay: MTLTexture
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
     private let textureCache: CVMetalTextureCache
@@ -119,14 +142,17 @@ public final class VideoDitherer: @unchecked Sendable {
     private var described = false
     private var failureNoted = false
 
-    /// Nil without a Metal device, or when the pass cannot be compiled.
-    public convenience init?(options: VideoDitherOptions = VideoDitherOptions(), deband: VideoDebandOptions? = nil) {
-        self.init(options: options, deband: deband, synchronousMatrix: false)
+    /// Nil without a Metal device, or when the pass cannot be compiled. `device` nil is the system's
+    /// default; a host that hands the pass an overlay gives the device its textures are on.
+    public convenience init?(options: VideoDitherOptions = VideoDitherOptions(), deband: VideoDebandOptions? = nil,
+                             device: MTLDevice? = nil) {
+        self.init(options: options, deband: deband, device: device, synchronousMatrix: false)
     }
 
     /// `synchronousMatrix` builds a missing fruit matrix before returning (tests).
-    init?(options: VideoDitherOptions, deband: VideoDebandOptions? = nil, synchronousMatrix: Bool) {
-        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
+    init?(options: VideoDitherOptions, deband: VideoDebandOptions? = nil, device: MTLDevice? = nil,
+          synchronousMatrix: Bool) {
+        guard let device = device ?? MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
               let cache else { return nil }
@@ -149,6 +175,12 @@ public final class VideoDitherer: @unchecked Sendable {
         // `.none` reads no matrix, but the shader still has one bound.
         let values = options.algorithm == .none ? [0] : fruit ?? DitherMatrix.bayer(size: DitherMatrix.orderedSize)
         guard let first = Self.matrixTexture(values, device: device) else { return nil }
+        let clear = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+        clear.usage = [.shaderRead]
+        guard let noOverlay = device.makeTexture(descriptor: clear) else { return nil }
+        var transparent: UInt32 = 0
+        noOverlay.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &transparent, bytesPerRow: 4)
+        self.noOverlay = noOverlay
 
         self.device = device
         self.queue = queue
@@ -191,7 +223,13 @@ public final class VideoDitherer: @unchecked Sendable {
     ///
     /// `debandRangeScale` multiplies the deband radius: a caller whose frames were scaled up from the source
     /// passes the factor (frame height over source height) so the radius stays in source pixels.
-    public func dither(_ buffer: CVPixelBuffer, debandRangeScale: Double = 1) -> CVPixelBuffer? {
+    ///
+    /// `overlay` gives a picture to blend over the frame before it is dithered, or nil for none. It is
+    /// called once, with the frame's command buffer: passes it encodes there (to draw the overlay's
+    /// texture) run before this one, so the frame still costs one commit and one wait. It runs while the
+    /// pass is locked and must not call back into it. When `dither` returns nil those passes may not have run.
+    public func dither(_ buffer: CVPixelBuffer, debandRangeScale: Double = 1,
+                       overlay: ((MTLCommandBuffer) -> VideoDitherOverlay?)? = nil) -> CVPixelBuffer? {
         guard let layout = Self.layout(of: CVPixelBufferGetPixelFormatType(buffer)), Self.isSDR(buffer) else { return nil }
         lock.lock(); defer { lock.unlock() }
         let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
@@ -203,13 +241,15 @@ public final class VideoDitherer: @unchecked Sendable {
               let commands = queue.makeCommandBuffer()
         else { return failed("no buffer or texture for a \(width)x\(height) frame") }
 
+        let placed = overlay?(commands).flatMap { $0.frameRect.width > 0 && $0.frameRect.height > 0 ? $0 : nil }
         var params = Self.params(layout: layout, matrix: UpscaleMatrix.of(buffer), bits: outputBits,
                                  matrixSize: options.algorithm == .none ? 0 : matrixSize,
                                  chromaOffset: Self.chromaOffset(of: buffer, luma: (width, height),
                                                                  chroma: (chroma.texture.width, chroma.texture.height)),
                                  phase: Self.phase(frame: frameIndex, options: options),
                                  deband: deband, debandRangeScale: debandRangeScale,
-                                 frameIndex: UInt32(truncatingIfNeeded: frameIndex))
+                                 frameIndex: UInt32(truncatingIfNeeded: frameIndex),
+                                 overlayRect: placed?.frameRect, overlayUVScale: placed?.uvScale ?? SIMD2(1, 1))
         frameIndex &+= 1
 
         let pass = MTLRenderPassDescriptor()
@@ -222,6 +262,7 @@ public final class VideoDitherer: @unchecked Sendable {
         encoder.setFragmentTexture(luma.texture, index: 0)
         encoder.setFragmentTexture(chroma.texture, index: 1)
         encoder.setFragmentTexture(matrix, index: 2)
+        encoder.setFragmentTexture(placed?.texture ?? noOverlay, index: 3)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         commands.commit()
@@ -229,6 +270,7 @@ public final class VideoDitherer: @unchecked Sendable {
         // The CVMetalTextures must live until the GPU is done with them.
         withExtendedLifetime((luma.reference, chroma.reference, target.reference)) {}
         CVMetalTextureCacheFlush(textureCache, 0)
+        _lastGPUSeconds = max(0, commands.gpuEndTime - commands.gpuStartTime)
         guard commands.status == .completed else {
             return failed("command buffer \(commands.status.rawValue): \(commands.error.map { "\($0)" } ?? "no error")")
         }
@@ -300,7 +342,8 @@ public final class VideoDitherer: @unchecked Sendable {
     /// sample of 1.0 is code 65535 / 64, not 1023. `matrixSize` 0 is no matrix (plain rounding).
     static func params(layout: Layout, matrix: UpscaleMatrix, bits: Int, matrixSize: Int,
                        chromaOffset: SIMD2<Float>, phase: UInt32, deband: VideoDebandOptions? = nil,
-                       debandRangeScale: Double = 1, frameIndex: UInt32 = 0) -> DitherShaderParams {
+                       debandRangeScale: Double = 1, frameIndex: UInt32 = 0,
+                       overlayRect: CGRect? = nil, overlayUVScale: SIMD2<Float> = SIMD2(1, 1)) -> DitherShaderParams {
         let codeScale: Float = layout.bits > 8 ? 65535.0 / 64.0 : 255.0
         let unit: Float = layout.bits > 8 ? 4 : 1
         let maxCode: Float = layout.bits > 8 ? 1023 : 255
@@ -338,7 +381,9 @@ public final class VideoDitherer: @unchecked Sendable {
             biasCentre: matrixSize > 0 ? 0.5 / Float(matrixSize * matrixSize) : 0.5,
             chromaOffset: chromaOffset, debandThreshold: debandThreshold, debandGrain: debandGrain,
             matrixSize: UInt32(matrixSize), phase: phase,
-            debandIterations: debandIterations, frameIndex: frameIndex, debandRange: debandRange)
+            debandIterations: debandIterations, frameIndex: frameIndex, debandRange: debandRange,
+            overlayRect: overlayRect.map { SIMD4(Float($0.minX), Float($0.minY), Float($0.maxX), Float($0.maxY)) } ?? .zero,
+            overlayUVScale: overlayUVScale, overlayEnabled: overlayRect == nil ? 0 : 1)
     }
 
     /// Where the chroma samples sit, in chroma texels to add to a centred lookup. Untagged is left-sited,

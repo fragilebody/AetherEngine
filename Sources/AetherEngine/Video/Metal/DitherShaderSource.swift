@@ -30,11 +30,19 @@ struct DitherShaderParams {
     var frameIndex: UInt32 = 0
     /// Deband radius of the first iteration, in luma pixels of the frame processed.
     var debandRange: Float = 0
+    /// Where the overlay sits on the frame, in frame pixels from the top left: (min x, min y, max x, max y).
+    var overlayRect: SIMD4<Float> = .zero
+    /// The part of the overlay texture its picture covers, from the texture's top-left corner.
+    var overlayUVScale: SIMD2<Float> = SIMD2(1, 1)
+    /// 0 is no overlay.
+    var overlayEnabled: UInt32 = 0
 }
 
 /// One pass: bi-planar Y'CbCr, optionally debanded (libplacebo's `pl_shader_deband`, which mpv's `--deband`
 /// runs), to R'G'B' at full precision, then mpv's dither to the output's bit depth. SDR only, so the
-/// conversion is the plain matrix on the coded (gamma) values, where mpv dithers too.
+/// conversion is the plain matrix on the coded (gamma) values, where mpv dithers too. An overlay
+/// (premultiplied RGBA, `VideoDitherOverlay`) is blended over the R'G'B' picture before the dither, so
+/// its soft edges are dithered with the picture.
 enum DitherShaderSource {
     static let source = """
     #include <metal_stdlib>
@@ -53,6 +61,9 @@ enum DitherShaderSource {
         uint debandIterations;
         uint frameIndex;
         float debandRange;
+        float4 overlayRect;
+        float2 overlayUVScale;
+        uint overlayEnabled;
     };
 
     struct DitherVertex { float4 position [[position]]; };
@@ -93,7 +104,8 @@ enum DitherShaderSource {
                                     constant DitherParams &p [[buffer(0)]],
                                     texture2d<float> yTex [[texture(0)]],
                                     texture2d<float> cTex [[texture(1)]],
-                                    texture2d<float> matrix [[texture(2)]]) {
+                                    texture2d<float> matrix [[texture(2)]],
+                                    texture2d<float> overlay [[texture(3)]]) {
         uint2 pos = uint2(in.position.xy);
         float2 lumaSize = float2(yTex.get_width(), yTex.get_height());
         float2 chromaSize = float2(cTex.get_width(), cTex.get_height());
@@ -129,6 +141,15 @@ enum DitherShaderSource {
         float3 rgb = saturate(float3(r, g, b));
         // Float error must not let the pattern lift true black off zero.
         rgb = select(rgb, float3(0.0), rgb < float3(1e-5));
+
+        // The overlay over the picture: out = src + dst * (1 - src.a). Linear: exact at 1:1 (pixel
+        // centres land on texel centres), smooth when the overlay is scaled.
+        if (p.overlayEnabled != 0 && all(in.position.xy >= p.overlayRect.xy) && all(in.position.xy < p.overlayRect.zw)) {
+            constexpr sampler overlaySampler(coord::normalized, filter::linear, address::clamp_to_edge);
+            float2 uv = (in.position.xy - p.overlayRect.xy) / (p.overlayRect.zw - p.overlayRect.xy) * p.overlayUVScale;
+            float4 o = overlay.sample(overlaySampler, uv);
+            rgb = saturate(o.rgb + rgb * (1.0 - o.a));
+        }
 
         float bias = p.biasCentre;
         uint n = p.matrixSize;
