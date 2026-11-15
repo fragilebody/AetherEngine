@@ -157,6 +157,43 @@ extension HLSVideoEngine {
     /// are whatever `find_stream_info` plus the cue prewarm happened to scan: a 10 s-GOP TS measured
     /// here indexed 1.400, 59.960, 60.000, 60.280, 121.360, whose smallest gap (0.04 s) and largest
     /// (58.6 s) both miss the real 10 s by an order of magnitude in opposite directions.
+    /// The most a keyframe may precede the boundary of a measured uniform grid and still open it.
+    static let uniformGridReachSeconds: Double = 0.5
+
+    /// The cutter's and the restart gate's reach for every boundary of a uniform grid whose stride
+    /// was MEASURED off the source's own IRAPs (an index-less MPEG-TS with a fixed GOP, which is
+    /// what a progressive transcode is).
+    ///
+    /// Such a grid follows the keyframes, but only as closely as one measurement allows. The spacing
+    /// is read between the first two IRAPs, where a 250-frame GOP at 23.976 fps is 938437.5 ticks and
+    /// the stream stamps 938437 and 938438 in turn; a stride taken from the long one puts boundary
+    /// 134 sixty-six ticks (0.7 ms) AFTER the keyframe it stands for. Without a reach that keyframe
+    /// belongs to the segment before: the cutter doubles a segment, and a restart, whose seek and
+    /// gate take nothing below the boundary, opens a whole GOP late and carries that as a shift.
+    /// Mid-file the shift lands every seek a GOP past its aim; in the last GOP it leaves the end of
+    /// the playlist with no content and AVPlayer waiting on it without ever reaching the end.
+    ///
+    /// Held to a quarter of the stride so the keyframe before never reaches. Zero for a grid that
+    /// was not measured: its boundaries stand for no keyframe in particular.
+    static func uniformGridReachTicks(spacing: KeyframeSpacing, strideSeconds: Double,
+                                      videoTimeBase: AVRational) -> Int64 {
+        guard case .measured(let seconds) = spacing, seconds.isFinite, seconds > 0,
+              strideSeconds.isFinite, strideSeconds > 0,
+              videoTimeBase.num > 0, videoTimeBase.den > 0 else { return 0 }
+        let reachSeconds = Swift.min(uniformGridReachSeconds, strideSeconds / 4)
+        let ticks = reachSeconds * Double(videoTimeBase.den) / Double(videoTimeBase.num)
+        return ticks.isFinite && ticks >= 1 && ticks < Double(Int64.max / 2) ? Int64(ticks) : 0
+    }
+
+    /// Where a restart at a boundary seeks: the boundary itself, less its reach on a measured
+    /// uniform grid, so the keyframe that boundary stands for is in front of the read position
+    /// rather than just behind it. Never below the plan's own start.
+    static func restartSeekPts(boundaryPts: Int64, uniformGridReachTicks: Int64, planStartPts: Int64) -> Int64 {
+        guard uniformGridReachTicks > 0 else { return boundaryPts }
+        let (aim, overflow) = boundaryPts.subtractingReportingOverflow(uniformGridReachTicks)
+        return overflow ? boundaryPts : Swift.max(Swift.min(planStartPts, boundaryPts), aim)
+    }
+
     static func uniformStrideSeconds(spacing: KeyframeSpacing) -> Double {
         switch spacing {
         case .measured(let seconds) where seconds.isFinite && seconds > 0:

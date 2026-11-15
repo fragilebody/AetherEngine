@@ -901,6 +901,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var planKeyframeReachTicks: [Int64] = []
     /// `Demuxer.indexedKeyframeAdvanceTicks` of a keyframe-aligned plan, held until the plan is final.
     var planKeyframeAdvanceTicks: Int64 = 0
+    /// `uniformGridReachTicks` of a measured uniform grid: the reach of every boundary of that plan,
+    /// and how far below a boundary a restart seeks. Zero for every other plan.
+    var planUniformGridReachTicks: Int64 = 0
 
     /// Guards subsystem refs + `sessionEpoch`. Never held across waits or network I/O so
     /// `stop()` on the main thread is never blocked behind a restart's 5 s waitForFinish.
@@ -1506,6 +1509,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         var plan: [Segment]
         var keyframeBytePositions: [Int64: Int64] = [:]
         planKeyframeAdvanceTicks = 0
+        planUniformGridReachTicks = 0
         if isLiveSession {
             sourceBitrate = dem.bitRate
             self.firstKeyframePts = 0
@@ -1653,6 +1657,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                         fromSeconds: anchorSeconds
                     )
                     stride = Self.uniformStrideSeconds(spacing: spacing)
+                    planUniformGridReachTicks = Self.uniformGridReachTicks(
+                        spacing: spacing, strideSeconds: stride, videoTimeBase: videoTimeBase)
                 }
                 plan = Self.buildUniformSegmentPlan(
                     videoTimeBase: videoTimeBase,
@@ -1977,6 +1983,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         (plan, planKeyframeReachTicks) = Self.finalizedPlan(
             plan, minDurationSeconds: Self.minSegmentDurationSeconds,
             keyframeAdvance: planKeyframeAdvanceTicks, keyframes: Array(keyframeBytePositions.keys))
+        if planUniformGridReachTicks > 0 {
+            planKeyframeReachTicks = Array(repeating: planUniformGridReachTicks, count: plan.count)
+        }
         self.segmentPlan = plan
         if !keyframeBytePositions.isEmpty {
             sourcePeakBitrate = Self.peakSegmentBitrate(plan: plan, keyframeBytePositions: keyframeBytePositions)
@@ -5312,9 +5321,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // seek fails fast instead of racing teardown.
         let seekStart = DispatchTime.now()
         // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
-        if activeDem.isDiscSource || !activeDem.seek(to: targetStartPts, streamIndex: videoStreamIndex) {
-            let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
-            activeDem.seek(to: absoluteTargetSeconds)
+        // On a measured uniform grid the keyframe a boundary stands for can sit a hair below it
+        // (`uniformGridReachTicks`); a seek that takes nothing below the boundary starts a GOP late.
+        let seekPts = Self.restartSeekPts(boundaryPts: targetStartPts,
+                                          uniformGridReachTicks: planUniformGridReachTicks,
+                                          planStartPts: segmentPlan.first?.startPts ?? targetStartPts)
+        if activeDem.isDiscSource || !activeDem.seek(to: seekPts, streamIndex: videoStreamIndex) {
+            let absoluteSeekSeconds = Double(seekPts) * Double(videoTb.num) / Double(videoTb.den)
+            activeDem.seek(to: absoluteSeekSeconds)
         }
         // AE#782: after the seek, so a container whose seek reads (a TS bisection) spends none of it.
         activeDem.notePlaybackRepositioned()
