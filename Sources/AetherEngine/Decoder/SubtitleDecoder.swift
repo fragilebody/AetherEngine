@@ -120,6 +120,11 @@ enum SubtitleDecoder {
                 url: local, httpHeaders: [:], preserveASSMarkup: preserveASSMarkup,
                 requested: requested, keepsBitmapPackets: keepsBitmapPackets)
         }
+        // A picture-based or container sidecar over HTTP stays on the reader, but only once its origin
+        // has answered: a server that extracts it on request answers in minutes, not seconds.
+        if SidecarOriginWait.appliesTo(url, formatHint: formatHint) {
+            try await SidecarOriginWait.wait(for: url, headers: httpHeaders)
+        }
         // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
         // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
         let token = CancelFlag()

@@ -68,6 +68,16 @@ This fork is upstream plus a few changes, rebased onto each upstream tag it foll
   are on, `device` exposes it, and `lastGPUSeconds` is the GPU time of the last frame. No overlay, the
   default, is the pass as it was.
 
+### 7.58.4 - 2026-11-17 (on upstream 7.58.0)
+
+- **A picture-based subtitle file from a server that extracts it on request showed nothing.** A PGS or
+  VobSub sidecar over HTTP is read by the playback reader, which gives an origin seconds for its first
+  byte. Jellyfin answers the first request for an embedded PGS or VobSub track only after extracting
+  every subtitle stream of the item in one pass over the file, which on a film-length remux takes
+  minutes, so the request timed out with nothing read and the selected track stayed blank. The origin
+  is now asked for one byte first, and that request is waited for up to 600 s (`SidecarOriginWait`);
+  the reader opens once it has answered. Text sidecars keep their whole-body fetch (AE#984).
+
 ## [Unreleased]
 
 ### Fixed

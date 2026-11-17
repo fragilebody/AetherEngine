@@ -31,6 +31,11 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("Quarantine is bounded to 96 MiB and 10,000 packets", try documentation())
     }
 
+    func testPictureSidecarOriginWaitMatchesDocumentation() throws {
+        XCTAssertEqual(SidecarOriginWait.firstResponseTimeout, 600)
+        assertDocumented("which waits up to 600 s for a server that extracts the stream on request", try documentation())
+    }
+
     func testSoftwarePositioningBudgetMatchesDocumentation() throws {
         XCTAssertEqual(SoftwarePlaybackHost.seekBudgetSeconds, 30)
         assertDocumented("**30 s positioning\nbudget**", try documentation())
