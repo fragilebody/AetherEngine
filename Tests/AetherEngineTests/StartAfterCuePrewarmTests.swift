@@ -32,7 +32,7 @@ struct StartAfterCuePrewarmTests {
 
     /// The engine's start sequence: open, index pass (seek to the middle, read, seek back to 0),
     /// then playback reads forward from 0 through the head and past it.
-    private func startSequence(notePlayback: Bool) throws -> (ThrottledOriginServer, AVIOReader, Bool) {
+    private func startSequence(notePlayback: Bool, readBytes: Int) throws -> (ThrottledOriginServer, AVIOReader, Bool) {
         let server = try #require(ThrottledOriginServer(totalSize: 64 * 1024 * 1024, throttleUs: 1000, patternedBody: true))
         let reader = makeReader(server)
         try reader.open()
@@ -50,26 +50,33 @@ struct StartAfterCuePrewarmTests {
         reader.endIndexPass()
         if notePlayback { reader.notePlaybackRepositioned() }
 
-        let ok = readForward(reader, buf, bytes: 3 * 1024 * 1024, from: 0)
+        let ok = readForward(reader, buf, bytes: readBytes, from: 0)
         return (server, reader, ok)
     }
 
     @Test("after the reposition note, the first miss past the head opens the connection there",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func firstMissAnchors() throws {
-        let (server, reader, ok) = try startSequence(notePlayback: true)
+        // The head holds whatever the open-phase connection delivered, up to its cap: 2.5 MiB on a
+        // loaded CI runner. So the miss is somewhere inside that cap, and the read runs past it.
+        let headCap = Int64(AVIOReader.headSpanMaxBytes)
+        let (server, reader, ok) = try startSequence(notePlayback: true,
+                                                     readBytes: AVIOReader.headSpanMaxBytes + 1024 * 1024)
         defer { reader.markClosed(); reader.close(); server.stop() }
         #expect(ok, "playback read the wrong bytes")
         #expect(reader.detourResidentBlocksForTesting == 0,
                 "playback's first miss was served as a detour block: \(server.requestedRanges.map(\.start))")
-        #expect(server.requestedRanges.contains { $0.start > 0 && $0.start < 2 * 1024 * 1024 && ($0.end ?? Int64.max) - $0.start + 1 > 4 * 1024 * 1024 },
+        #expect(server.requestedRanges.contains { $0.start > 0 && $0.start <= headCap && ($0.end ?? Int64.max) - $0.start + 1 > 4 * 1024 * 1024 },
                 "no streaming connection was anchored near the head: \(server.requestedRanges.map { ($0.start, $0.end as Any) })")
     }
 
     @Test("without the note the same start detours, which is the 4 s the field trace paid",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func withoutNoteDetours() throws {
-        let (server, reader, ok) = try startSequence(notePlayback: false)
+        // Read past the head cap, as above: a slow runner can let the head fill beyond 3 MiB, and a
+        // read the head serves in full never misses, so it never detours either.
+        let (server, reader, ok) = try startSequence(notePlayback: false,
+                                                     readBytes: AVIOReader.headSpanMaxBytes + 1024 * 1024)
         defer { reader.markClosed(); reader.close(); server.stop() }
         #expect(ok)
         #expect(reader.detourResidentBlocksForTesting >= 1)

@@ -80,6 +80,10 @@ final class MP4SegmentMuxer {
         let nalFramingLatch: NALFramingLatch?
         /// A stereo source's signalling (`StereoVideoSignal`); nil leaves the track as the source has it.
         let stereo: StereoVideoSignal?
+        /// Clear the conformance window of HEVC coded 3840x2176 and cropped to 2160, and crop with a
+        /// `clap` box instead (`HEVCConformanceCrop`). On by default on tvOS, where the window restarts
+        /// an Apple TV; tests turn it on elsewhere.
+        let clearsUHDPaddingCrop: Bool
 
         init(
             codecpar: UnsafePointer<AVCodecParameters>,
@@ -90,7 +94,8 @@ final class MP4SegmentMuxer {
             extradataOverride: [UInt8]? = nil,
             convertsAnnexBSamples: Bool = false,
             nalFramingLatch: NALFramingLatch? = nil,
-            stereo: StereoVideoSignal? = nil
+            stereo: StereoVideoSignal? = nil,
+            clearsUHDPaddingCrop: Bool = VideoConfig.clearsUHDPaddingCropByDefault
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
@@ -101,7 +106,14 @@ final class MP4SegmentMuxer {
             self.convertsAnnexBSamples = convertsAnnexBSamples
             self.nalFramingLatch = nalFramingLatch
             self.stereo = stereo
+            self.clearsUHDPaddingCrop = clearsUHDPaddingCrop
         }
+
+        #if os(tvOS)
+        static let clearsUHDPaddingCropByDefault = true
+        #else
+        static let clearsUHDPaddingCropByDefault = false
+        #endif
     }
 
     struct AudioConfig {
@@ -180,6 +192,11 @@ final class MP4SegmentMuxer {
     /// The current segment's staging file or memory buffer. Only appended to, then adopted as it
     /// stands, which is what lets progressive delivery read it while it is written.
     private(set) var currentStaging: SegmentStaging
+    /// The current segment's staging file, nil while it is written into memory (fork, memory-segments).
+    var stagingURL: URL? {
+        if case .file(let url) = currentStaging { return url }
+        return nil
+    }
     /// Fork (memory-segments): asked for a memory buffer each time a segment opens; nil, or a nil
     /// answer, stages the segment in a file as upstream does.
     private let memoryStaging: ((Int) -> MemorySegmentBuffer?)?
@@ -208,8 +225,13 @@ final class MP4SegmentMuxer {
     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
     private let videoNALLengthPrefixSize: Int?
+    private let isHEVCVideo: Bool
+    private var shortHEVCHeadersRemoved = 0
     /// Latched from `VideoConfig.convertsAnnexBSamples`.
     private let convertsAnnexBVideoSamples: Bool
+    /// The init segment's SPS lost its 2176-to-2160 padding crop (`HEVCConformanceCrop`), so in-band
+    /// copies must lose it too.
+    private let removesUHDPaddingCrop: Bool
     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
     /// parser refuses, so the rung underneath it (the software-path escalation) would have nothing to
     /// be measured against. Read once from the environment, never set in a shipped configuration.
@@ -323,6 +345,9 @@ final class MP4SegmentMuxer {
         audioDelaySeconds: Double = 0,
         onStorageExhausted: (@Sendable () -> Void)? = nil,
         memoryStaging: ((Int) -> MemorySegmentBuffer?)? = nil,
+        admitStagingBytes: (@Sendable (URL, Int) -> SegmentWriteAdmission)? = nil,
+        discardStaging: (@Sendable (URL) -> Void)? = nil,
+        isOneShot: Bool = false,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -334,6 +359,12 @@ final class MP4SegmentMuxer {
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
         self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
+        self.isHEVCVideo = video.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+        removesUHDPaddingCrop = Self.cropFreeConfiguration(for: video) != nil
+        if removesUHDPaddingCrop {
+            // A one-shot builder (I-frame, JPEG, preview) makes a muxer per keyframe: one line per session is enough.
+            EngineLog.emit("[MP4SegmentMuxer] 3840x2176 HEVC cropped to 2160: conformance window cleared in the init segment and in-band SPS, clap crops to 2160 (Apple TV hardware decode)", category: .session, level: isOneShot ? .verbose : .info)
+        }
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
@@ -374,6 +405,12 @@ final class MP4SegmentMuxer {
         let counter = ByteCounter()
         counter.fd = firstFd
         counter.memory = firstMemory
+        if firstMemory == nil {
+            counter.currentPath = firstPath
+            counter.ownedPaths.insert(firstPath)
+        }
+        counter.admitStagingBytes = admitStagingBytes
+        counter.discardStaging = discardStaging
         counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
@@ -413,6 +450,14 @@ final class MP4SegmentMuxer {
                     return
                 }
                 guard counter.fd >= 0 else { return }
+                if let path = counter.currentPath, let admit = counter.admitStagingBytes {
+                    let admission = admit(path, count)
+                    guard admission == .admitted else {
+                        if admission == .storageExhausted { counter.onStorageExhausted?() }
+                        counter.writeFailed = true
+                        return
+                    }
+                }
                 var written = 0
                 while written < count {
                     let n = write(counter.fd, ptr.advanced(by: written), count - written)
@@ -637,6 +682,13 @@ final class MP4SegmentMuxer {
         if let extradata = video.extradataOverride {
             Self.replaceExtradata(videoStream.pointee.codecpar, with: extradata)
         }
+        if let cropFree = Self.cropFreeConfiguration(for: video) {
+            Self.replaceExtradata(videoStream.pointee.codecpar, with: cropFree)
+            // The sample entry states the coded height, and movenc turns the crop side data into a
+            // `clap` of 3840x2160, so AVFoundation hides the padding lines the decoder now hands out.
+            videoStream.pointee.codecpar.pointee.height = 2160 + Int32(HEVCConformanceCrop.paddingLines)
+            Self.setTVOSPaddingClap(videoStream.pointee.codecpar, lines: HEVCConformanceCrop.paddingLines)
+        }
         if video.stereo == .multiview {
             // movenc writes `lhvC` (the second layer's parameter sets, which the extradata carries after
             // the base layer's) only for a stream with this disposition, and a new stream has none. The
@@ -745,8 +797,20 @@ final class MP4SegmentMuxer {
 
         // Before the AE#561 sanitizer, which walks the sample as the length-prefixed chain the
         // record declares. A packet with no start code is written as it came.
+        var convertedFromAnnexB = false
         if convertsAnnexBVideoSamples, streamIndex == videoOutputStreamIndex {
-            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet)
+            convertedFromAnnexB = AnnexBSampleConverter.convertToLengthPrefixed(
+                packet, removeUHDPaddingCrop: removesUHDPaddingCrop)
+        }
+        // A packet the converter left alone (no start code) is length-prefixed already.
+        if !convertedFromAnnexB, removesUHDPaddingCrop, streamIndex == videoOutputStreamIndex,
+           let prefixSize = videoNALLengthPrefixSize, let data = packet.pointee.data, packet.pointee.size > 0,
+           let cropFree = HEVCConformanceCrop.removingUHDPaddingCrop(
+               fromLengthPrefixed: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+               prefixSize: prefixSize) {
+            // An hev1 or Matroska source can repeat its SPS in the sample; the decoder would read the
+            // window back from there.
+            _ = AnnexBSampleConverter.replacePayload(packet, with: cropFree)
         }
 
         // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment
@@ -798,6 +862,46 @@ final class MP4SegmentMuxer {
                 return (0, .none)
             }
             av_shrink_packet(packet, Int32(complete))
+        }
+
+        if streamIndex == videoOutputStreamIndex, isHEVCVideo,
+            !Self.nalChainSanitizerDisabled, let width = videoNALLengthPrefixSize,
+            let data = packet.pointee.data, packet.pointee.size > 0
+        {
+            let ranges = NALUnitChain.shortHEVCHeaderRanges(
+                UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+                lengthPrefixSize: width,
+                framingConfirmed: convertsAnnexBVideoSamples || videoNALFraming.isConfirmed)
+            if !ranges.isEmpty {
+                let result = av_packet_make_writable(packet)
+                guard result >= 0, let writable = packet.pointee.data else { return (result, .none) }
+                let count = Int(packet.pointee.size)
+                var read = 0
+                var write = 0
+                for range in ranges {
+                    let kept = range.lowerBound - read
+                    if kept > 0 {
+                        memmove(writable + write, writable + read, kept)
+                        write += kept
+                    }
+                    read = range.upperBound
+                }
+                if read < count {
+                    memmove(writable + write, writable + read, count - read)
+                    write += count - read
+                }
+                shortHEVCHeadersRemoved += ranges.count
+                if shortHEVCHeadersRemoved <= 5 || shortHEVCHeadersRemoved % 100 == 0 {
+                    EngineLog.emit(
+                        "[MP4SegmentMuxer] removed \(ranges.count) incomplete HEVC NAL header(s) "
+                            + "at dts=\(packet.pointee.dts), preserving \(write) sample bytes", category: .session)
+                }
+                av_shrink_packet(packet, Int32(write))
+                if write == 0 {
+                    av_packet_unref(packet)
+                    return (0, .none)
+                }
+            }
         }
 
         // The packet is consumed by the write below.
@@ -968,6 +1072,7 @@ final class MP4SegmentMuxer {
             return
         }
         byteCounter.bytesWrittenCurrentSegment = 0
+        if case .file(let path) = currentStaging { byteCounter.discardStaging?(path) }
     }
 
     /// Finalize the current segment and rotate fd to a fresh staging file for `nextIdx`.
@@ -1018,6 +1123,9 @@ final class MP4SegmentMuxer {
         }
 
         byteCounter.noteFragmentCut()
+        // The caller owns the finished file from here (adopt or delete); the set only tracks what is still ours.
+        if case .file(let completedPath) = completed { byteCounter.ownedPaths.remove(completedPath) }
+        byteCounter.currentPath = nil
 
         if let memory = memoryStaging?(nextIdx) {
             self.currentStaging = .memory(memory)
@@ -1032,6 +1140,8 @@ final class MP4SegmentMuxer {
             self.currentStaging = .file(nextPath)
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
+            byteCounter.currentPath = nextPath
+            byteCounter.ownedPaths.insert(nextPath)
         } catch {
             if Self.isOutOfSpace(error) { byteCounter.onStorageExhausted?() }
             // isWedged: splitter would silently discard next fragment bytes until the pump failed a cut later.
@@ -1084,11 +1194,15 @@ final class MP4SegmentMuxer {
             if case .file(let finalPath) = final { try? FileManager.default.removeItem(at: finalPath) }
             return nil
         }
+        if case .file(let finalPath) = final { byteCounter.ownedPaths.remove(finalPath) }
         return (staging: final, bytesWritten: finalBytes)
     }
 
     /// Whether a segment is open for writing: a staging file descriptor or a memory buffer.
     private var hasOutput: Bool { fd >= 0 || byteCounter.memory != nil }
+
+    /// Staging files this muxer would still delete on deinit; one while a session runs (audit SEG-204).
+    var ownedStagingPathCount: Int { byteCounter.ownedPaths.count }
 
     // MARK: - Path helpers
 
@@ -1148,10 +1262,13 @@ final class MP4SegmentMuxer {
     }
 
     deinit {
-        if fd >= 0 {
-            close(fd)
-        }
+        byteCounter.writeFailed = true  // cleanup must not append to an abandoned staging file.
         cleanup()
+        if fd >= 0 { close(fd) }
+        for path in byteCounter.ownedPaths {
+            try? FileManager.default.removeItem(at: path)  // adopted paths were renamed and no longer exist here.
+            byteCounter.discardStaging?(path)
+        }
     }
 
     // MARK: - AVIO
@@ -1283,6 +1400,10 @@ final class MP4SegmentMuxer {
                 rec.pointee.dv_profile = profile
                 rec.pointee.dv_bl_signal_compatibility_id = blCompatibilityID
                 rec.pointee.el_present_flag = 0
+                // A Profile 20 source carries version 3.0, and VideoToolbox refuses a Profile 5 record
+                // that says so (-12910). Profiles 5 and 8 are version 1.0 records.
+                rec.pointee.dv_version_major = 1
+                rec.pointee.dv_version_minor = 0
             }
             return
         }
@@ -1336,6 +1457,42 @@ final class MP4SegmentMuxer {
         return bytes
     }
 
+    /// The video configuration with the 2176-to-2160 padding crop cleared, or nil when the track is
+    /// not HEVC of that geometry or the config leaves the crop alone. Reads the override when there is
+    /// one, the source extradata otherwise.
+    static func cropFreeConfiguration(for video: VideoConfig) -> [UInt8]? {
+        guard video.clearsUHDPaddingCrop, video.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else { return nil }
+        if let override = video.extradataOverride {
+            return HEVCConformanceCrop.removingUHDPaddingCrop(fromConfiguration: override)
+        }
+        guard let extradata = video.codecpar.pointee.extradata, video.codecpar.pointee.extradata_size > 0 else {
+            return nil
+        }
+        let bytes = [UInt8](UnsafeBufferPointer(start: extradata, count: Int(video.codecpar.pointee.extradata_size)))
+        return HEVCConformanceCrop.removingUHDPaddingCrop(fromConfiguration: bytes)
+    }
+
+    /// Replaces any crop side data with one that makes movenc write the `clap` tvOS needs to hide
+    /// `lines` padding lines at the bottom. A failed allocation only leaves the padding lines visible,
+    /// so it does not fail the session.
+    ///
+    /// tvOS applies the clap's vertical offset with the opposite sign to the spec and to macOS. For a
+    /// bottom crop of 16 the spec offset is -8, which an Apple TV (AppleTV14,1, measured with a test
+    /// pattern over HLS and MP4) shows as lines 16 to 2175: 16 lines of picture lost at the top, 16 of
+    /// padding at the bottom. +8 shows lines 0 to 2159 there, so the side data states a TOP crop, which
+    /// movenc writes as +8. macOS would show this file 16 lines low, which is why it is tvOS only.
+    private static func setTVOSPaddingClap(_ codecpar: UnsafeMutablePointer<AVCodecParameters>, lines: Int) {
+        av_packet_side_data_remove(codecpar.pointee.coded_side_data, &codecpar.pointee.nb_coded_side_data,
+                                   AV_PKT_DATA_FRAME_CROPPING)
+        // Four little-endian UInt32 in movenc's order: top, bottom, left, right.
+        guard let item = av_packet_side_data_new(
+            &codecpar.pointee.coded_side_data, &codecpar.pointee.nb_coded_side_data,
+            AV_PKT_DATA_FRAME_CROPPING, 16, 0),
+              let raw = item.pointee.data else { return }
+        memset(raw, 0, 16)
+        raw[0] = UInt8(lines)
+    }
+
     /// Replace codecpar.extradata using av_malloc + AV_INPUT_BUFFER_PADDING_SIZE pad.
     private static func replaceExtradata(
         _ codecpar: UnsafeMutablePointer<AVCodecParameters>,
@@ -1361,6 +1518,10 @@ final class MP4SegmentMuxer {
 /// Ref-typed mutable state shared between the FragmentSplitter closures and the muxer
 /// (closures can't capture self during init).
 private final class ByteCounter {
+    var currentPath: URL?
+    var ownedPaths: Set<URL> = []
+    var admitStagingBytes: (@Sendable (URL, Int) -> SegmentWriteAdmission)?
+    var discardStaging: (@Sendable (URL) -> Void)?
     var fd: Int32 = -1
     /// Fork (memory-segments): the memory buffer the current segment is written into, if any.
     var memory: MemorySegmentBuffer?

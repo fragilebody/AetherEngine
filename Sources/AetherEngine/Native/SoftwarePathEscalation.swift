@@ -85,6 +85,11 @@ enum SoftwarePathEscalation {
         let nativeRemoteHLS: Bool
         /// `LoadOptions.escalatesToSoftwarePath`: false when the host re-plans a failing title itself.
         var hostAllowsEscalation: Bool = true
+        /// AE#990: the bypass is playing a finite playlist, the one shape with an ingest to land on.
+        var finitePlaylist: Bool = false
+        /// The session can be rebuilt in place. A non-seekable custom source (a live ingest, a host's
+        /// forward-only reader) refuses every rebuild, so the rung is not on offer (audit LOAD-204).
+        var rebuildPossible: Bool = true
     }
 
     /// The rebuild a still-waiting `load()` hands its wait to (AE#629). `supersededGeneration` is the
@@ -117,10 +122,13 @@ enum SoftwarePathEscalation {
         guard let availability, !availability.alreadyEscalated else { return false }
         // AE#629: a host with its own fallback ladder needs the failure, not a rescue it cannot see.
         guard availability.hostAllowsEscalation else { return false }
+        guard availability.rebuildPossible else { return false }
         // Already there, or the host asked for a path this cannot improve on.
         guard availability.preferredDecodePath == .automatic else { return false }
-        // The bypass has no local muxer and decodes nothing here, so #461 ignores the option anyway.
-        guard !availability.nativeRemoteHLS else { return false }
+        // The bypass decodes nothing itself. AE#990: a finite playlist's rebuild re-runs the load with
+        // `.software`, which takes the seekable TS ingest when the playlist is MPEG-TS and otherwise
+        // mounts AVPlayer once more, whose failure then surfaces. A live one has its own reroutes.
+        guard !availability.nativeRemoteHLS || availability.finitePlaylist else { return false }
         return errorDomain == mediaErrorDomain || errorDomain == liveJoinErrorDomain
             || errorDomain == videoConfigurationErrorDomain
     }

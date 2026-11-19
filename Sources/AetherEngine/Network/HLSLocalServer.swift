@@ -27,6 +27,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// has gone is answered with an error response rather than the bytes the bookkeeping promised.
     func mediaSegmentURL(at index: Int) -> URL?
 
+    /// Live only: the segment left the window and will never be served again, so the server answers
+    /// 404 (AVPlayer resyncs on it) instead of a retriable 503. Default false.
+    func liveSegmentIsGone(_ index: Int) -> Bool
+
     /// AE#418 round 7: what became of a media-segment request. `delivered` is true once the whole
     /// response went out; false when it was refused or the write failed on a client that hung up.
     /// The axis is a statement about bytes in AVPlayer's timeline, so a placement composed from a
@@ -103,11 +107,16 @@ protocol HLSSegmentProvider: AnyObject {
     /// AVFoundation has nothing above the segment layer that says "object audio" and settles on the
     /// bed, which is how an Atmos stream-copy reached an Atmos-capable receiver as 5.1 PCM.
     var masterAudioChannels: String? { get }
+    /// AE#1049: the source's other audio tracks, URI-less entries in the same group as
+    /// `masterAudioRendition`. Empty unless the host opted in.
+    var masterAudioAlternates: [AudioRenditionChoice] { get }
 
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
     /// NAMEs must be unique within the group (duplicates collapse AVFoundation's legible options).
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { get }
+    /// AE#1050: ordinals whose rendition is SDH, declared with CHARACTERISTICS in the master.
+    var nativeSubtitleHearingImpairedOrdinals: Set<Int> { get }
     /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
     var nativeSubtitleDefaultOrdinal: Int { get }
     /// Serve the SUBTITLES rendition as one whole-program .vtt (single VOD segment) instead of per-video-segment (Sodalite#32).
@@ -117,6 +126,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// playlist one segment per video segment, so the embedded reader (parked ~90s ahead of the playhead)
     /// has the cues for a segment in the store by the time AVPlayer fetches it.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String?
+    /// AE#1052: true while `ordinal` is a menu marker, served empty on purpose.
+    func nativeSubtitleServesSilently(ordinal: Int) -> Bool
 
     /// AE#682: true when this session lists an I-frame rendition in its master. The two calls below
     /// answer `iframe_init.mp4` and `iframe{N}.mp4`; both may block on a source read.
@@ -183,6 +194,7 @@ extension HLSSegmentProvider {
         mediaSegment(at: index, onSlow: onSlow).map { .data($0) }
     }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
+    func liveSegmentIsGone(_ index: Int) -> Bool { false }
     func didServeMediaSegment(index: Int, delivered: Bool) {}
     func didDeliverProgressiveChunk(index: Int) {}
     var staticMasterPlaylistBody: String? { nil }
@@ -202,10 +214,13 @@ extension HLSSegmentProvider {
     var masterClosedCaptions: String? { nil }
     var masterAudioRendition: (language: String?, name: String)? { nil }
     var masterAudioChannels: String? { nil }
+    var masterAudioAlternates: [AudioRenditionChoice] { [] }
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
+    var nativeSubtitleHearingImpairedOrdinals: Set<Int> { [] }
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
+    func nativeSubtitleServesSilently(ordinal: Int) -> Bool { false }
     var iFrameRenditionServed: Bool { false }
     var iFrameRenditionFormat: IFrameRenditionFormat? { nil }
     func iFrameInitSegment() -> Data? { nil }
@@ -1224,7 +1239,8 @@ final class HLSLocalServer: @unchecked Sendable {
         case let p where p.hasPrefix("/subs_") && p.hasSuffix(".vtt"):
             // #15: one WebVTT segment built on demand from the cue store's window for this video segment.
             guard let parsed = Self.parseSubsPath(p), let seg = parsed.segment,
-                  let vtt = provider?.nativeSubtitleVTT(ordinal: parsed.ordinal, segmentIndex: seg) else {
+                  let prov = provider,
+                  let vtt = prov.nativeSubtitleVTT(ordinal: parsed.ordinal, segmentIndex: seg) else {
                 return send404(fd: fd, path: normalizedPath, reason: "no subtitle segment for \(normalizedPath)")
             }
             // Sodalite#156: an EMPTY segment is the reported defect and a populated one is routine, so
@@ -1233,11 +1249,12 @@ final class HLSLocalServer: @unchecked Sendable {
             // a visible level would push the surrounding evidence out of the 300-line ring, and it is
             // exactly the surrounding evidence that says WHY a segment came out empty.
             let cues = vtt.components(separatedBy: "-->").count - 1
-            if cues == 0 {
+            // An AE#1052 marker is empty on purpose and gets refetched on the next select.
+            if cues == 0, prov.nativeSubtitleServesSilently(ordinal: parsed.ordinal) == false {
                 EngineLog.emit("[HLSLocalServer] served an EMPTY subtitle .vtt ord=\(parsed.ordinal) "
                                + "seg=\(seg) bytes=\(vtt.utf8.count); the receiver caches this segment "
                                + "as it is and never asks again", category: .hlsServer)
-            } else {
+            } else if cues > 0 {
                 EngineLog.emit("[HLSLocalServer] served subtitle .vtt ord=\(parsed.ordinal) seg=\(seg) "
                                + "bytes=\(vtt.utf8.count) cues=\(cues)", category: .hlsServer, level: .verbose)
             }
@@ -1377,7 +1394,8 @@ final class HLSLocalServer: @unchecked Sendable {
                     let providerCount = provider?.segmentCount ?? -1
                     let reason = "segment[\(index)] empty (segmentCount=\(providerCount))"
                     switch Self.classifySegmentResponse(
-                        index: index, segmentCount: providerCount, hasData: false) {
+                        index: index, segmentCount: providerCount, hasData: false,
+                        liveGone: provider?.liveSegmentIsGone(index) ?? false) {
                     case .serve:
                         // Unreachable: hasData is false here.
                         return refused(send404(fd: fd, path: normalizedPath, reason: reason))
@@ -1646,8 +1664,12 @@ final class HLSLocalServer: @unchecked Sendable {
         case notFound
     }
 
-    static func classifySegmentResponse(index: Int, segmentCount: Int, hasData: Bool) -> SegmentResponseKind {
+    static func classifySegmentResponse(index: Int, segmentCount: Int, hasData: Bool,
+                                        liveGone: Bool = false) -> SegmentResponseKind {
         if hasData { return .serve }
+        // A live segment that left the window is a real 404: AVPlayer resyncs on it, and a 503
+        // would have it retry an index that never comes back (audit HLS-204).
+        if liveGone { return .notFound }
         if index >= 0, segmentCount > 0, index < segmentCount { return .retryLater }
         return .notFound
     }
@@ -1782,6 +1804,10 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     /// Pure playlist builders callable without a live server instance. subResourceBaseURL emits absolute URIs for AVAssetResourceLoader; nil emits relative URIs for the HTTP workflow.
+    /// CHARACTERISTICS of an SDH subtitle rendition, as Apple's HLS authoring spec spells it.
+    static let sdhCharacteristics = "public.accessibility.transcribes-spoken-dialog,"
+        + "public.accessibility.describes-music-and-sound"
+
     static func buildMasterPlaylistText(provider: HLSSegmentProvider,
                                          subResourceBaseURL: URL? = nil,
                                          variant: MasterPlaylistVariant = .primary) -> String {
@@ -1848,6 +1874,18 @@ final class HLSLocalServer: @unchecked Sendable {
                 audioAttrs.append("CHANNELS=\"\(channels)\"")
             }
             lines.append("#EXT-X-MEDIA:\(audioAttrs.joined(separator: ","))")
+            // AE#1049: the other tracks ride the same group without a URI. RFC 8216 reads that as
+            // "carried in the variant", which only the served track is; AVFoundation lists them
+            // anyway, and a pick is answered by a reload onto that track. AUTOSELECT=NO, or
+            // AVFoundation passes over DEFAULT=YES for the entry in the system language (measured
+            // on macOS 27).
+            for alt in provider.masterAudioAlternates {
+                var altAttrs = ["TYPE=AUDIO", "GROUP-ID=\"aud\"", "NAME=\"\(alt.name)\""]
+                if let language = alt.language { altAttrs.append("LANGUAGE=\"\(language)\"") }
+                altAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
+                if alt.channels > 0 { altAttrs.append("CHANNELS=\"\(alt.channels)\"") }
+                lines.append("#EXT-X-MEDIA:\(altAttrs.joined(separator: ","))")
+            }
         }
 
         // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
@@ -1856,9 +1894,14 @@ final class HLSLocalServer: @unchecked Sendable {
         // (the on-frame overlay owns fullscreen subtitles). The host explicitly selects the matching rendition
         // only on PiP entry and deselects it on PiP exit, so the two never double up.
         let subRenditions = provider.nativeSubtitleRenditions
+        let hearingImpaired = provider.nativeSubtitleHearingImpairedOrdinals
         for r in subRenditions {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
+            // AE#1050: same value the remote master rewrite writes, so AVKit can label the option SDH.
+            if hearingImpaired.contains(r.ordinal) {
+                mediaAttrs.append("CHARACTERISTICS=\"\(Self.sdhCharacteristics)\"")
+            }
             mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
             // Deliberately NO FORCED=YES, even for a source-forced track: AVKit force-displays a FORCED
             // rendition whose language matches the selected audio regardless of DEFAULT/AUTOSELECT and the

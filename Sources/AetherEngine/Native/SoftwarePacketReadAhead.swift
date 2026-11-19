@@ -280,20 +280,6 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         condition.unlock()
     }
 
-    /// Legacy explicit cold seek. Production first uses beginSeek(to:) + prepareSeek off-main.
-    @discardableResult
-    func beginSeek() -> UInt64 {
-        condition.lock(); defer { condition.unlock() }
-        generation &+= 1
-        sourceEpoch &+= 1
-        sourceRepositioning = true
-        seeking = true
-        resetPending = true
-        clearSourceMetadataLocked()
-        condition.broadcast()
-        return generation
-    }
-
     /// Main-thread safe: freeze only the decoder/consumer, not the source reader or retained data.
     @discardableResult
     func beginSeek(to seconds: Double) -> UInt64 {
@@ -341,8 +327,6 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                 return true
             } catch SoftwarePacketDiskFIFO.Failure.invalidCursor {
                 // An expired bookmark is a cache miss, never a playback/disk failure.
-            } catch SoftwarePacketDiskFIFO.Failure.retentionDisabled {
-                // Keeps callers using the legacy destructive FIFO safe during migration.
             }
         }
 
@@ -813,10 +797,19 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     /// Seconds of video the producer has built ahead of the consumer: from the packet the consumer
     /// last took out of the store to the newest one put into it. nil when no stored timestamp can
     /// express it, which is a reason to stay responsive, never a reason to relax.
+    ///
+    /// AE#1053: these are raw source timestamps, upstream of the live fold, so a PTS seam between the
+    /// two packets reads as a reservoir the producer could never have built. A +347 s spike parked the
+    /// producer until the consumer had eaten everything stored before it, and the audio lead drained
+    /// to 0.3 s on the way. On a forward-only source a distance past any reachable fill is a seam, which
+    /// nothing here can measure. A VOD cache keeps its history, so a cached seek back legitimately leaves
+    /// more stored than the window, and there the old reading stands.
     private func reservoirSecondsLocked() -> Double? {
         guard let stored = storedVideoSeconds else { return nil }
         let seconds = stored - (consumedVideoSeconds ?? sourceClock)
-        return seconds.isFinite ? max(0, seconds) : nil
+        guard seconds.isFinite else { return nil }
+        if forwardOnly, abs(seconds) >= forwardSeconds + LiveTimelineFold.thresholdSeconds { return nil }
+        return max(0, seconds)
     }
 
     /// AE#519: the producer may only drop to the efficiency class while the consumer provably

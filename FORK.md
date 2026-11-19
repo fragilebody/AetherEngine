@@ -40,7 +40,16 @@ existing muxer tests).
 
 ## Based on
 
-Upstream tag `7.58.0`. Fork tag `7.58.0-memory.4`.
+Upstream tag `7.70.0`, merged into the fork (branch `merge/upstream-7.70.0`) rather than rebased: the fork's
+history since 7.58.0 is kept. Earlier fork tags: `7.58.0-memory.4`, `7.58.1` to `7.58.4`.
+
+What the 7.70.0 merge had to reconcile:
+
+- Upstream's staging-write admission (`sessionCacheHardLimitBytes`, `sessionCacheFreeReserveBytes`, audit
+  SEG-204) applies to file staging only. A segment muxed into memory is not admitted against the disk limit,
+  owns no staging path, and `evictHardDiskHistoryLocked` evicts file entries only.
+- Upstream's pipelined GPU stage (`PipelinedFrameStage`, AE#957) delivers upscaled frames in order on its
+  delivery queue; the dither pass is the handler it delivers to, so it still runs after the upscale stage.
 
 ## Rebasing onto a new upstream tag
 
@@ -58,7 +67,7 @@ git push origin <new-tag>-memory.1
 ```
 
 Conflicts land almost always in `SegmentCache.swift` (entries are `SegmentStorage`, not `URL`) and in
-`MP4SegmentMuxer.swift` (the staging is `SegmentStaging`). Then bump the host app's exact package
+`MP4SegmentMuxer.swift` (the staging is `SegmentStaging`; `stagingURL` is nil for a memory segment). Then bump the host app's exact package
 version to the new fork tag.
 
 ## Dithering

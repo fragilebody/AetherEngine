@@ -28,7 +28,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     private let diagnosticContext: SourceNetworkDiagnostics.Context?
     private let playlistURL: URL
     private let httpHeaders: [String: String]
-    private let session: URLSession
+    /// Internal for `HLSVODIngestCloseSessionTests`, which creates a task on it after `close()`.
+    let session: URLSession
     private let ownsSession: Bool
     /// AE#732: set under `LoadOptions.heldSourceConnection`. Every request of this reader then goes over
     /// one persistent HTTP/1.1 connection per origin, segments one at a time, instead of `session`.
@@ -91,6 +92,22 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         }
     }
 
+    /// Which carriage a caller takes the ingest for.
+    enum Acceptance: Equatable, Sendable {
+        /// AE#268: only the carriage AVFoundation builds no video track for.
+        case hevcInMPEGTS
+        /// AE#990: any MPEG-TS, for a session that decodes in software and so never wants AVPlayer.
+        case anyMPEGTS
+
+        func accepts(_ verdict: MPEGTransportStreamCodecProbe.Verdict) -> Bool {
+            switch verdict {
+            case .hevcInMPEGTS: return true
+            case .transportStreamWithoutHEVC: return self == .anyMPEGTS
+            case .otherCarriage, .inconclusive: return false
+            }
+        }
+    }
+
     /// Returns a pre-resolved reader only when the finite playlist has positive
     /// content evidence for HEVC in MPEG-TS. Unknown, live, fMP4, H.264 and
     /// demuxed-audio shapes stay on the existing native remote-HLS route.
@@ -99,6 +116,21 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         httpHeaders: [String: String],
         session: URLSession? = nil,
         persistentHTTP1: Bool = false,
+        diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context
+    ) async throws -> HLSVODIngestReader? {
+        try await makeIfMPEGTS(playlistURL: playlistURL, httpHeaders: httpHeaders, session: session,
+                               persistentHTTP1: persistentHTTP1, accepting: .hevcInMPEGTS,
+                               diagnosticContext: diagnosticContext)
+    }
+
+    /// Returns a pre-resolved reader when the finite, unencrypted playlist's first segment carries a
+    /// PMT that `acceptance` takes. Unknown, live, fMP4 and demuxed-audio shapes return nil.
+    static func makeIfMPEGTS(
+        playlistURL: URL,
+        httpHeaders: [String: String],
+        session: URLSession? = nil,
+        persistentHTTP1: Bool = false,
+        accepting acceptance: Acceptance,
         diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context
     ) async throws -> HLSVODIngestReader? {
         let reader = HLSVODIngestReader(
@@ -123,7 +155,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
                 return nil
             }
             guard try await reader.probeCarriage(segmentURL, duration: first.duration,
-                                                 byteRange: first.byteRange) == .hevcInMPEGTS else {
+                                                 byteRange: first.byteRange, acceptance: acceptance) else {
                 return nil
             }
             reader.condition.withLock {
@@ -301,6 +333,16 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         task?.cancel()
         primed?.body.abandon()
         transport?.close()
+        // Cancel, never invalidate here: a fetch the cancelled producer's segment batch has not reached
+        // yet still creates its task on this session, and a task created on an invalidated session
+        // raises an Objective-C exception that aborts the process. A task created after this point
+        // ends at once through its own task's cancellation. Invalidation waits for deinit.
+        if ownsSession {
+            session.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+        }
+    }
+
+    deinit {
         if ownsSession {
             session.invalidateAndCancel()
         }
@@ -418,9 +460,11 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             func spawn(_ index: Int) {
                 let item = resolvedSegments[index]
                 group.addTask {
-                    let bytes = try await self.fetch(
-                        item.1, limit: BoundedFetch.segmentLimit(forDuration: item.0.duration),
-                        byteRange: item.0.byteRange)
+                    let bytes = try await Self.retryingSegment {
+                        try await self.fetch(
+                            item.1, limit: BoundedFetch.segmentLimit(forDuration: item.0.duration),
+                            byteRange: item.0.byteRange)
+                    }
                     guard let crypt = item.0.crypt else { return (index, bytes) }
                     return (
                         index,
@@ -489,8 +533,10 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             // A sub-range is fetched whole like a ciphertext: an origin that ignores `Range` answers with
             // the entire resource, and only a complete body can be cut down to the segment.
             if segment.crypt != nil || segment.byteRange != nil {
-                var bytes = try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration),
-                                            byteRange: segment.byteRange)
+                var bytes = try await Self.retryingSegment {
+                    try await self.fetch(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration),
+                                         byteRange: segment.byteRange)
+                }
                 if let crypt = segment.crypt {
                     bytes = try await decrypt(bytes, crypt: crypt, baseURL: mediaURL)
                 }
@@ -508,7 +554,9 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             } else {
                 primed?.body.abandon()
                 primed = nil
-                body = try await openSegment(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration))
+                body = try await Self.retryingSegment {
+                    try await self.openSegment(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration))
+                }
                 head = Data()
             }
             guard try await stream(head: head, body: body, checkCarriage: offset == 0, generation: generation)
@@ -618,6 +666,50 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         bufferedBytes += data.count
         condition.broadcast()
         return true
+    }
+
+    /// One segment request is tried this many times before the ingest ends. The live ingest has always
+    /// retried a segment; a single reset or 5xx on a VOD one used to be terminal (audit NET-R201). Only a
+    /// request that has handed nothing to the FIFO is repeated, so no byte is ever delivered twice.
+    static let maxSegmentAttempts = 3
+
+    /// A failure another request may not repeat: a refusal the origin means (4xx other than 408 and 429),
+    /// a body over its limit, a format the ingest cannot carry, or a cancellation.
+    static func isTransientSegmentFailure(_ error: Error) -> Bool {
+        if error is CancellationError || error is BoundedFetch.Exceeded { return false }
+        if let ingest = error as? HLSIngestError {
+            guard case .playlistUnreachable(let status) = ingest else { return false }
+            return status == -1 || status == 408 || status == 429 || status >= 500
+        }
+        if let url = error as? URLError { return url.code != .cancelled }
+        if let connection = error as? PersistentHTTP1Connection.ConnectionError {
+            switch connection {
+            case .tooManyRedirects, .unsupportedURL: return false
+            case .malformed, .staleKeepAlive, .headDeadlineExceeded, .stalled: return true
+            }
+        }
+        return false
+    }
+
+    static func retryingSegment<T>(
+        attempts: Int = maxSegmentAttempts,
+        delay: (Int) -> TimeInterval = { 0.5 * Double($0) },
+        _ operation: () async throws -> T
+    ) async throws -> T {
+        var attempt = 1
+        while true {
+            do {
+                return try await operation()
+            } catch {
+                guard attempt < attempts, isTransientSegmentFailure(error) else { throw error }
+                EngineLog.emit("[HLSVODIngest] segment request failed (\(EngineLog.summary(of: error))), "
+                               + "attempt \(attempt)/\(attempts); retrying", category: .engine)
+                let pause = delay(attempt)
+                if pause > 0 { try await Task.sleep(nanoseconds: UInt64(pause * 1_000_000_000)) }
+                try Task.checkCancellation()
+                attempt += 1
+            }
+        }
     }
 
     private func fail(_ error: Error, generation: UInt64) {
@@ -767,8 +859,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     /// range: its resource is the whole file, which overruns the segment limit on the persistent path.
     /// That response goes after the verdict, since the segment is fetched again on its own request.
     private func probeCarriage(
-        _ url: URL, duration: Double, byteRange: HLSByteRange? = nil
-    ) async throws -> MPEGTransportStreamCodecProbe.Verdict {
+        _ url: URL, duration: Double, byteRange: HLSByteRange? = nil, acceptance: Acceptance
+    ) async throws -> Bool {
         if transport != nil {
             // The probe reads the head and leaves the response open: stopping the body here would
             // cost the connection, and reading it whole delays the start by the whole segment.
@@ -787,7 +879,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
                 throw error
             }
             guard !head.isEmpty else { throw HLSIngestError.unsupportedSegmentFormat }
-            if verdict == .hevcInMPEGTS, byteRange == nil {
+            let accepted = acceptance.accepts(verdict)
+            if accepted, byteRange == nil {
                 let displaced = condition.withLock { () -> PrimedSegment? in
                     defer { primedSegment = PrimedSegment(url: url, head: head, body: body) }
                     return primedSegment
@@ -796,14 +889,14 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             } else {
                 body.abandon()
             }
-            return verdict
+            return accepted
         }
-        return try await HLSCarriageProbe.classifySegmentHead(
+        return acceptance.accepts(try await HLSCarriageProbe.classifySegmentHead(
             url: url,
             httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: url),
             session: session,
             diagnosticContext: diagnosticContext
-        )
+        ))
     }
 
     private func decrypt(
@@ -850,7 +943,10 @@ enum MPEGTransportStreamCodecProbe {
         /// PMT declares HEVC: AVFoundation builds no video track for this carriage (HLS Authoring
         /// Spec sanctions HEVC only in fMP4), so the source belongs on the ingest.
         case hevcInMPEGTS
-        /// Not MPEG-TS at all, or a PMT that declares something AVPlayer carries itself.
+        /// AE#990: MPEG-TS whose PMT declares no HEVC (H.264, MPEG-2, audio). AVPlayer builds this
+        /// carriage itself, so it only reaches the ingest when the session is asked to decode in software.
+        case transportStreamWithoutHEVC
+        /// Not MPEG-TS at all.
         case otherCarriage
         /// Not enough evidence yet; read further or, at the ceiling, leave the source on its route.
         case inconclusive
@@ -870,17 +966,18 @@ enum MPEGTransportStreamCodecProbe {
             guard bytes[packetStart] == 0x47 else { return .otherCarriage } // lost packet alignment
             switch programMapVerdict(bytes, packetStart: packetStart) {
             case .hevcInMPEGTS: return .hevcInMPEGTS
-            case .otherCarriage: sawPMT = true
+            case .transportStreamWithoutHEVC, .otherCarriage: sawPMT = true
             case .inconclusive: break
             }
             packetStart += packetSize
         }
-        return sawPMT ? .otherCarriage : .inconclusive
+        return sawPMT ? .transportStreamWithoutHEVC : .inconclusive
     }
 
     /// One packet's contribution: `inconclusive` unless it opens a PMT section, which is then read for
     /// an HEVC elementary stream. A PMT split across packets is only judged on its first packet; a
-    /// declaration hiding past that boundary reads as `otherCarriage` and keeps the native route.
+    /// declaration hiding past that boundary reads as `transportStreamWithoutHEVC` and keeps the
+    /// native route.
     private static func programMapVerdict(
         _ bytes: [UInt8],
         packetStart: Int
@@ -918,7 +1015,7 @@ enum MPEGTransportStreamCodecProbe {
             }
             stream = descriptorsEnd
         }
-        return .otherCarriage
+        return .transportStreamWithoutHEVC
     }
 
     /// AE#718: a descriptor loop that runs past its own bounds is not evidence, so a truncated

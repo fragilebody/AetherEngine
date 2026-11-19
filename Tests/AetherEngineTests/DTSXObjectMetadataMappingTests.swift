@@ -38,11 +38,34 @@ struct DTSXObjectMetadataMappingTests {
         #expect(DTSXObjectAudioDecoder.folds.allSatisfy { $0.gain == 23170 / 32768 })
     }
 
+    @Test("each presentation folds its heights at its profile's gain, and an unmeasured one has none")
+    func foldsByPresentation() {
+        let standard: Float = 23170 / 32768
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 1) == standard)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0xd0) == 1)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0xd1) == standard)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0xd3) == standard)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0xd4) == nil)
+        #expect(DTSXObjectAudioDecoder.foldGain(presentation: 0) == nil)
+        #expect(DTSXObjectAudioDecoder.unityFolds.allSatisfy { $0.gain == 1 })
+        #expect(DTSXObjectAudioDecoder.unityFolds.map(\.plane) == DTSXObjectAudioDecoder.folds.map(\.plane))
+        #expect(DTSXObjectAudioDecoder.unityFolds.map(\.element) == DTSXObjectAudioDecoder.folds.map(\.element))
+    }
+
     @Test("the standard channels play one to one on 7.1.4 and 9.1.6, and only there")
     func oneToOneLayouts() {
         for layout in SpatialSpeakerLayout.allCases {
             #expect(layout.carriesDTSXOneToOne == (layout == .l714 || layout == .l916), "\(layout.rawValue)")
         }
+    }
+
+    @Test("a layout that does not carry the standard channels one to one renders DTS:X as 7.1.4")
+    func bedFallback() {
+        #expect(SpatialSpeakerLayout.l512.dtsxBed == .l714)
+        #expect(SpatialSpeakerLayout.l514.dtsxBed == .l714)
+        #expect(SpatialSpeakerLayout.l712.dtsxBed == .l714)
+        #expect(SpatialSpeakerLayout.l714.dtsxBed == .l714)
+        #expect(SpatialSpeakerLayout.l916.dtsxBed == .l916)
     }
 
     @Test("a channel plays at unity on its speaker")

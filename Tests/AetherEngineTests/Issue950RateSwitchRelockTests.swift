@@ -45,4 +45,16 @@ struct Issue950RateSwitchRelockTests {
                 attribution: .engineRateOnly, relation: .exact(panelRate: 23.976), heldForMs: 0, preWrite: preWrite))
         }
     }
+
+    // Round 2, LG C3 on 7.58.0: a restart within ~2 s of a stop wrote while the reset's switch back to
+    // 50 Hz was running, and that switch's end settled the gate at 50.001 Hz, four times in a row.
+    @Test("An end with no start since a write made during a running switch belongs to that switch")
+    func endOfSwitchInFlightAtWriteIsNotTheWritesOwn() {
+        #expect(DisplayCriteriaController.endBelongsToInFlightSwitch(
+            switchInFlightAtWrite: true, startNotifiedSinceWrite: false))
+        #expect(!DisplayCriteriaController.endBelongsToInFlightSwitch(
+            switchInFlightAtWrite: true, startNotifiedSinceWrite: true))
+        #expect(!DisplayCriteriaController.endBelongsToInFlightSwitch(
+            switchInFlightAtWrite: false, startNotifiedSinceWrite: false))
+    }
 }

@@ -124,6 +124,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// still extractor is the only caller, everything on a playback path wants the parallel default.
     var decodesSingleThreaded = false
 
+    /// Decode threads on a playback path: one per core, at most 16.
+    ///
+    /// Under frame threading every thread past the first holds one frame back until more packets
+    /// arrive, so the count is also output delay, and libavcodec warns above 16 ("Using a thread
+    /// count greater than 16 is not recommended"), where its own automatic choice stops. Uncapped on
+    /// an 18-core Mac (Mac17,6) the decoder held 17 frames: a 40-packet progressive H.264 delivered
+    /// 23, and a Live source whose reads stalled kept 17 frames it had already received off the
+    /// screen. Capped it holds at most 15, as a 16-core Mac already did; that remaining delay is
+    /// frame threading's own. Apple TV, iPhone and iPad have far fewer cores.
+    nonisolated static func playbackThreadCount(activeProcessorCount: Int) -> Int {
+        max(1, min(16, activeProcessorCount))
+    }
+
     /// The pixel buffer format this decoder hands the display layer, read off the decoded frame (audit
     /// DEC-107). The container's declaration alone missed two cases: `color_range` was never read, so a
     /// full-range AV1 / VP9 / HEVC picture was labelled video range and shown crushed, and
@@ -174,6 +187,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// the decode thread afterwards, the same discipline `use10Bit` and the other open-time fields keep.
     private var containerColor = ColorDescription.unspecified
 
+    /// AE#957: the container's HDR10 static metadata (`mdcv` / `clli`, Matroska's colour metadata),
+    /// for a PQ stream. Written in `open` like `containerColor`.
+    private var containerHDR10 = HDR10StaticMetadataSEI.Values.none
+    /// The last values a decoded frame carried. libavcodec exports them only on some frames (HEVC on
+    /// the pictures whose access unit had the SEI), so they stay until a frame brings new ones. Updated
+    /// as each frame leaves the decoder; guarded by `lock`, like everything `emit` reads.
+    private var streamHDR10 = HDR10StaticMetadataSEI.Values.none
+
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
 
@@ -223,60 +244,51 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
         }
 
-        guard let ctx = avcodec_alloc_context3(codec) else {
-            throw VideoDecoderError.sessionCreationFailed(status: -1)
-        }
-        codecContext = ctx
-
-        guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
-            throw VideoDecoderError.noCodecParameters
-        }
-
-        // Reject VideoToolbox pixel format to force pure software decode (some decoders ignore this).
-        ctx.pointee.get_format = { _, fmts in
-            guard let fmts = fmts else { return AV_PIX_FMT_NONE }
-            var i = 0
-            while fmts[i] != AV_PIX_FMT_NONE {
-                if fmts[i] != AV_PIX_FMT_VIDEOTOOLBOX {
-                    return fmts[i]
-                }
-                i += 1
-            }
-            return AV_PIX_FMT_YUV420P
-        }
-
-        if decodesSingleThreaded {
-            // #544: a still run is one short GOP decoded once. Frame-level threading buys throughput
-            // nobody is waiting for and costs output delay plus a second worker pool.
-            ctx.pointee.thread_count = 1
-            ctx.pointee.thread_type = 0
-        } else {
-            ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
-            ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
-        }
-
         // 10-bit AV1 converts on the GPU, and its grain is applied there: dav1d only exports the
         // parameters. Decided before the open, since that is when dav1d reads whether to apply it.
         gpuConverter = nil
-        if GPUFrameConverter.enabled, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
-           codecpar.pointee.format == AV_PIX_FMT_YUV420P10LE.rawValue,
-           let converter = GPUFrameConverter() {
-            gpuConverter = converter
-            ctx.pointee.export_side_data |= Int32(AV_CODEC_EXPORT_DATA_FILM_GRAIN)
-        }
+        let ctx: UnsafeMutablePointer<AVCodecContext>
+        do {
+            ctx = try FFmpegDecoderContext.open(
+                codec: codec, codecpar: codecpar, maxPixels: FFmpegDecoderContext.maxVideoPixels,
+                // Belt-and-suspenders with the get_format rejection: some decoders ignore get_format.
+                options: ["hwaccel": "none"]
+            ) { ctx in
+                // Reject VideoToolbox pixel format to force pure software decode (some decoders ignore this).
+                ctx.pointee.get_format = FFmpegDecoderContext.softwareOnlyGetFormat
 
-        // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
-        var opts: OpaquePointer?
-        av_dict_set(&opts, "hwaccel", "none", 0)
+                if decodesSingleThreaded {
+                    // #544: a still run is one short GOP decoded once. Frame-level threading buys throughput
+                    // nobody is waiting for and costs output delay plus a second worker pool.
+                    ctx.pointee.thread_count = 1
+                    ctx.pointee.thread_type = 0
+                } else {
+                    ctx.pointee.thread_count = Int32(Self.playbackThreadCount(
+                        activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
+                    ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+                }
 
-        if onCacheTiming != nil { ctx.pointee.flags |= AV_CODEC_FLAG_COPY_OPAQUE }
-        guard avcodec_open2(ctx, codec, &opts) >= 0 else {
-            av_dict_free(&opts)
+                if GPUFrameConverter.enabled, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
+                   codecpar.pointee.format == AV_PIX_FMT_YUV420P10LE.rawValue,
+                   let converter = GPUFrameConverter() {
+                    gpuConverter = converter
+                    ctx.pointee.export_side_data |= Int32(AV_CODEC_EXPORT_DATA_FILM_GRAIN)
+                }
+
+                if onCacheTiming != nil { ctx.pointee.flags |= AV_CODEC_FLAG_COPY_OPAQUE }
+            }
+        } catch FFmpegDecoderContext.Failure.allocation {
+            throw VideoDecoderError.sessionCreationFailed(status: -1)
+        } catch FFmpegDecoderContext.Failure.parameters {
+            throw VideoDecoderError.noCodecParameters
+        } catch {
             throw VideoDecoderError.sessionCreationFailed(status: -2)
         }
-        av_dict_free(&opts)
+        codecContext = ctx
 
         containerColor = ColorDescription(codecpar: codecpar)
+        containerHDR10 = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
+            ? HDR10StaticMetadataSEI.fromCodedSideData(codecpar) : .none
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         use10Bit = bitsPerSample > 8 || isHDRTransfer
@@ -380,6 +392,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             // consumer reads the frame, for the same reason the timestamp repair below runs here.
             ColorDescription.backfill(frame: f, container: containerColor)
             decodedFormatKey = DecodedFormatKey(pixelFormat: f.pointee.format, color: ColorDescription(frame: f))
+            // AE#957: every decoded frame, so the values a pre-roll frame (skipped, not emitted) carried still count.
+            if f.pointee.nb_side_data > 0 {
+                streamHDR10 = HDR10StaticMetadataSEI.fromFrameSideData(f).filling(from: streamHDR10)
+            }
 
             // #407: repair the frame's own timestamp BEFORE anything reads it. A frame that reaches
             // the renderer with no PTS is unschedulable and gets dropped there, so every consumer
@@ -426,32 +442,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
                    deinterlacer.push(f) >= 0 {
                     decodedFormatKey?.deinterlace = deinterlacer.activeDeinterlace
+                    av_frame_unref(f)
                     if filtered == nil { filtered = av_frame_alloc() }
-                    if let out = filtered {
-                        while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
-                            // Untimestamped output is unschedulable: yadif's SECOND field is
-                            // cur.pts + next.pts, which is NOPTS whenever either source frame
-                            // lacked a PTS (live TS delivers those); an invalid-PTS sample
-                            // can't be paced by the render synchronizer and can wedge the
-                            // display queue. Drop it; at field rate the neighbor field covers.
-                            if out.pointee.pts == Int64.min {
-                                droppedUntimestampedFields += 1
-                                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
-                                    EngineLog.emit(
-                                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
-                                        category: .swPlayback
-                                    )
-                                }
-                                av_frame_unref(out)
-                                continue
-                            }
-                            // Filtered PTS rides the sink's time_base, NOT the stream's: yadif/bwdif
-                            // halve the link time_base, and send_field puts the two fields of a frame
-                            // on odd/even ticks of that halved base (see DeinterlaceFilter class doc).
-                            emit(out, timeBase: deinterlacer.outputTimeBase)
-                            av_frame_unref(out)
-                        }
-                    }
+                    if let out = filtered { emitFilteredFramesLocked(out) }
                     lock.unlock()
                     continue
                 }
@@ -465,6 +458,39 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         av_frame_free(&frame)
         if filtered != nil { av_frame_free(&filtered) }
+    }
+
+    /// Pulls everything the deinterlacer can produce into `out` and emits it. Called under `lock`.
+    /// A pull error other than EAGAIN or EOF drops the graph (DEC-202).
+    private func emitFilteredFramesLocked(_ out: UnsafeMutablePointer<AVFrame>) {
+        while true {
+            let ret = deinterlacer.pull(into: out)  // filter holds 1-2 frames lookahead; push can yield EAGAIN
+            guard ret >= 0 else {
+                deinterlacer.noteGraphError(afterPull: ret)
+                break
+            }
+            // Untimestamped output is unschedulable: yadif's SECOND field is
+            // cur.pts + next.pts, which is NOPTS whenever either source frame
+            // lacked a PTS (live TS delivers those); an invalid-PTS sample
+            // can't be paced by the render synchronizer and can wedge the
+            // display queue. Drop it; at field rate the neighbor field covers.
+            if out.pointee.pts == Int64.min {
+                droppedUntimestampedFields += 1
+                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
+                    EngineLog.emit(
+                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
+                        category: .swPlayback
+                    )
+                }
+                av_frame_unref(out)
+                continue
+            }
+            // Filtered PTS rides the sink's time_base, NOT the stream's: yadif/bwdif
+            // halve the link time_base, and send_field puts the two fields of a frame
+            // on odd/even ticks of that halved base (see DeinterlaceFilter class doc).
+            emit(out, timeBase: deinterlacer.outputTimeBase)
+            av_frame_unref(out)
+        }
     }
 
     /// Convert + deliver one decoded (or deinterlaced) frame: skip threshold, pixel buffer
@@ -553,6 +579,31 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         flush(resetFilterGraph: true)
     }
 
+    /// AE#1024: `flush()` discards what libavcodec still holds, which at the end of a file is the last
+    /// frames of the stream (frame threading plus B-frame reorder). A session paused in the last half
+    /// second then never got a picture at all. The empty packet puts the decoder into draining mode,
+    /// the receive loop hands those frames over, and the `flush()` the host makes next takes it out of
+    /// that mode again.
+    func drainForEndOfStream() {
+        lock.lock()
+        guard let ctx = codecContext else { lock.unlock(); return }
+        let ret = avcodec_send_packet(ctx, nil)
+        lock.unlock()
+        guard ret >= 0 else { return }
+        drainDecodedFrames()
+        // DEC-203: the deinterlacer still holds the last picture, waiting for a next one that never comes.
+        lock.lock()
+        defer { lock.unlock() }
+        guard codecContext != nil, deinterlacer.isActive else { return }
+        if deinterlacer.sendEndOfStream() >= 0 {
+            var out = av_frame_alloc()
+            if let out { emitFilteredFramesLocked(out) }
+            av_frame_free(&out)
+        }
+        // An EOF'ed graph takes no more input, whatever the caller's flush asks for.
+        deinterlacer.teardown()
+    }
+
     func flush(resetFilterGraph: Bool) {
         lock.lock()
         defer { lock.unlock() }
@@ -608,6 +659,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             VTPixelTransferSessionInvalidate(session)
             transferSession = nil
         }
+        streamHDR10 = .none
         // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
         onFrame = nil
         onCacheTiming = nil
@@ -784,6 +836,33 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
+        attachHDR10(from: frame, to: pb)
+    }
+
+    /// AE#957: HDR10 static metadata (mastering display, content light level) for a PQ frame: the
+    /// latest a decoded frame carried (`streamHDR10`), else the container's. Without it the television
+    /// gets HDR10 with no static metadata, as it did from VideoToolbox's frames. Every other frame
+    /// has both keys removed, since a pool buffer comes back with what its last use left on it.
+    private func attachHDR10(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
+        let values = frame.pointee.color_trc == AVCOL_TRC_SMPTE2084
+            ? streamHDR10.filling(from: containerHDR10) : .none
+        Self.setHDR10(values, on: pb)
+    }
+
+    /// Sets the keys `values` has and removes the others.
+    static func setHDR10(_ values: HDR10StaticMetadataSEI.Values, on pb: CVPixelBuffer) {
+        if let masteringDisplay = values.masteringDisplay {
+            CVBufferSetAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey,
+                                  masteringDisplay as CFData, .shouldPropagate)
+        } else {
+            CVBufferRemoveAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey)
+        }
+        if let contentLightLevel = values.contentLightLevel {
+            CVBufferSetAttachment(pb, kCVImageBufferContentLightLevelInfoKey,
+                                  contentLightLevel as CFData, .shouldPropagate)
+        } else {
+            CVBufferRemoveAttachment(pb, kCVImageBufferContentLightLevelInfoKey)
+        }
     }
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)

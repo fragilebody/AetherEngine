@@ -207,7 +207,14 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// clock run from the audio there. On the arrival-order path only the frontier counts, the newest
     /// timestamp with every earlier slot handed over, so a frame that came early past a gap does not
     /// open the gate.
+    ///
+    /// A full layer opens it too: nothing more can be handed over until the clock drains the layer,
+    /// so waiting only runs out `AudioOutput.prerollTimeout`. That is the resume after a rebuffer, whose
+    /// frames sit at or behind the stopped clock (AE#1025 follow-up: 2 s of standstill after every
+    /// rebuffer). A start or a seek begins with a flushed layer, which is not full.
     func prerollSatisfied(clock: Double, live: Bool) -> Bool? {
+        // Read outside `reorderLock`: the queue target answers it under its own locks.
+        let layerFull = !isReadyForMoreMediaData
         reorderLock.lock()
         defer { reorderLock.unlock() }
         guard clock.isFinite else { return nil }
@@ -215,6 +222,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         if rate == nil, live { return nil }
         let handed = arrivalFloor != nil ? arrivalFloor?.frontier : _lastReleasedPtsSeconds
         guard let handed else { return false }
+        if layerFull { return true }
         guard let rate else { return handed - clock >= Self.videoPrerollSeconds }
         return handed + 1 / rate - clock >= Self.felPrerollSeconds(frameRate: rate)
     }
@@ -266,6 +274,16 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
+    /// The host's own hook on the same moment, kept apart from the public #311 observer: the source
+    /// timestamp of every frame the queue target accepted, whether it left the reorder buffer on its own
+    /// or in a drain. Same locking as the observer.
+    private var _handoverHook: (@Sendable (Double) -> Void)?
+    func setHandoverHook(_ hook: (@Sendable (Double) -> Void)?) {
+        reorderLock.lock()
+        _handoverHook = hook
+        reorderLock.unlock()
+    }
+
     /// AE#395: the session's renderer axis, shared with the `AudioOutput` whose synchronizer this
     /// renderer runs on. Only the stamp on the sample buffer moves onto it; the reorder buffer, the
     /// frontier and the frame-time reports stay on the source axis. Guarded by `reorderLock`.
@@ -293,7 +311,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         return _flushGeneration
     }
 
-    /// Cached CMVideoFormatDescription keyed by dimensions + pixel format + colorimetry + pixel aspect ratio. CMVideoFormatDescriptionCreateForImageBuffer snapshots color AND aspect attachments at creation, so a mid-stream change at same dimensions must invalidate the cache; a PAR-less first frame froze a PAR-less description for the whole stream and collapsed anamorphic content to coded dimensions (#177). Guarded by reorderLock; nil'd by flush().
+    /// Cached CMVideoFormatDescription keyed by dimensions + pixel format + colorimetry + pixel aspect ratio + HDR10 static metadata. CMVideoFormatDescriptionCreateForImageBuffer snapshots color AND aspect attachments at creation, so a mid-stream change at same dimensions must invalidate the cache; a PAR-less first frame froze a PAR-less description for the whole stream and collapsed anamorphic content to coded dimensions (#177). Guarded by reorderLock; nil'd by flush().
     private var cachedFormatDesc: CMVideoFormatDescription?
     private var cachedFormatKey: FormatDescriptionKey?
 
@@ -307,6 +325,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
         var matrix: String?
         var parH: Int?
         var parV: Int?
+        /// HDR10 static metadata (AE#957): the description snapshots it too, so a change mid-stream
+        /// (a stream whose first frames carry none, or values that change mid-stream) must make a new one.
+        var masteringDisplay: Data?
+        var contentLightLevel: Data?
     }
 
     private var loggedLayerFailed = false
@@ -900,7 +922,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     /// AE#711 follow-up: the newest frame handed to the layer, before the subtitle compositor, for a
     /// rebuild to hold when the layer cannot say what it is showing (off screen, or before tvOS 17.4's
-    /// readback has anything). At most one buffer, released by `flush`.
+    /// readback has anything). At most one buffer, released by a `flush` that clears the picture: one
+    /// that keeps it (seek, recovery) leaves this frame on screen, so it stays the frame to hold.
     private var _lastEnqueuedFrame: CVPixelBuffer?
     var lastEnqueuedFrame: CVPixelBuffer? {
         reorderLock.lock(); defer { reorderLock.unlock() }
@@ -919,7 +942,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.lock()
         reorderBuffer.removeAll()
         _pendingPresentation.removeAll()
-        _lastEnqueuedFrame = nil
+        if removingDisplayedImage { _lastEnqueuedFrame = nil }
         // #407: the next frame handed over will not follow the last one, so the gap between them is
         // not a cadence measurement. Left standing, every seek would report one enormous interval.
         _lastHandedPtsSeconds = nil
@@ -1050,8 +1073,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.lock()
         let observer = _frameEnqueuedObserver
         let generation = _flushGeneration
+        let handoverHook = accepted ? _handoverHook : nil
         reorderLock.unlock()
         observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
+        if let handoverHook, pts.isNumeric { handoverHook(CMTimeGetSeconds(pts)) }
 
         reorderLock.lock()
         enqueueCount += 1
@@ -1120,7 +1145,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
             transfer: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) as? String,
             matrix: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) as? String,
             parH: (par?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey] as? NSNumber)?.intValue,
-            parV: (par?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? NSNumber)?.intValue
+            parV: (par?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? NSNumber)?.intValue,
+            masteringDisplay: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data,
+            contentLightLevel: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil) as? Data
         )
 
         // Guarded by reorderLock: flush() nils the cache from other threads.

@@ -10,7 +10,10 @@ import Foundation
 /// Reads are served from a single sliding read-ahead buffer. The read-ahead window is ADAPTIVE: it
 /// starts at `baseChunkSize` (so the scattered, kilobyte-sized disc-structure reads at open do not
 /// each pull a megabyte) and doubles up to `maxChunkSize` while reads stay sequential (so steady
-/// playback of the title's extents costs few requests); any non-contiguous read resets it. Each
+/// playback of the title's extents costs few requests); any non-contiguous read resets it. Once the
+/// window would reach `maxChunkSize` on a sequential continuation, the read pattern is playback, and
+/// a `ProgressiveRangeStream` takes over: ranges of up to `streamRangeSize` whose bytes reach the
+/// demuxer as they arrive, with `maxChunkSize` as the buffer's watermark (#1007). Each
 /// range request retries with backoff so a transient network blip does not end playback. The server
 /// MUST honor range requests (any static file host does); if it does not, `init` returns nil after a
 /// clear log and `open` throws `AVIOReaderError.originIgnoresRange`, and the response is hung up on at
@@ -27,6 +30,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     private let requestTimeout: TimeInterval
     private let baseChunkSize: Int
     private let maxChunkSize: Int
+    private let streamRangeSize: Int
     private let maxRetries: Int
     private let totalSize: Int64
     /// Warmed bytes (#647), read before the network. Immutable, so a fork shares them without a copy.
@@ -45,6 +49,14 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     /// must be able to set it from another thread while a read is in flight.
     private let cancelLock = NSLock()
     private var cancelled = false
+    /// The sequential stream (#1007), guarded by `lock`; `cancelLock` keeps a second reference so
+    /// `cancel()` can wake a read parked in it without taking `lock`.
+    private var stream: ProgressiveRangeStream?
+    /// Set by the first stream: disc discovery is over. From then on a sequential continuation
+    /// streams at once, so a seek pays one `baseChunkSize` fetch instead of re-ramping through
+    /// ~16 MiB of serial whole-body requests (#1007 retest: 3/5 seeks resumed late).
+    private var playbackStreaming = false
+    private var cancellableStream: ProgressiveRangeStream?
     /// This reader's own share of `lifetimeFetchedBytes`: every response body `fetchWithRetry`
     /// received, a rejected or retried one included, since it crossed the link either way.
     private let transferLock = NSLock()
@@ -62,6 +74,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                       extraHeaders: [String: String] = [:],
                       baseChunkSize: Int = 256 * 1024,
                       maxChunkSize: Int = 8 * 1024 * 1024,
+                      streamRangeSize: Int = 64 * 1024 * 1024,
                       maxRetries: Int = 3,
                       requestTimeout: TimeInterval = 30,
                       sessionConfiguration: URLSessionConfiguration? = nil,
@@ -75,9 +88,41 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             return nil
         }
         self.init(url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
-                  maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
+                  maxChunkSize: maxChunkSize, streamRangeSize: streamRangeSize,
+                  maxRetries: maxRetries, requestTimeout: requestTimeout,
                   session: session, totalSize: size,
                   residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [])
+    }
+
+    /// Audit DMX-201: lets a stopped open reach the size probe, which runs before any reader exists
+    /// for `Demuxer.markClosed()` to cancel. `cancel()` invalidates the probe's session (which
+    /// completes the request in flight) and tells the retry loop to stop.
+    final class OpenHandle: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        private var session: URLSession?
+
+        var isCancelled: Bool { lock.withLock { cancelled } }
+
+        func cancel() {
+            let toCancel: URLSession? = lock.withLock {
+                cancelled = true
+                defer { session = nil }
+                return session
+            }
+            toCancel?.invalidateAndCancel()
+        }
+
+        fileprivate func attach(_ newSession: URLSession) {
+            let alreadyCancelled: Bool = lock.withLock {
+                if cancelled { return true }
+                session = newSession
+                return false
+            }
+            if alreadyCancelled { newSession.invalidateAndCancel() }
+        }
+
+        fileprivate func detach() { lock.withLock { session = nil } }
     }
 
     /// `init?` for a caller that has to say why a disc image cannot be read: an origin that answers the
@@ -88,18 +133,23 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                      extraHeaders: [String: String] = [:],
                      baseChunkSize: Int = 256 * 1024,
                      maxChunkSize: Int = 8 * 1024 * 1024,
+                     streamRangeSize: Int = 64 * 1024 * 1024,
                      maxRetries: Int = 3,
                      requestTimeout: TimeInterval = 30,
                      sessionConfiguration: URLSessionConfiguration? = nil,
-                     prewarmed: PrewarmedSource? = nil) throws -> HTTPDiscIOReader? {
+                     prewarmed: PrewarmedSource? = nil,
+                     handle: OpenHandle? = nil) throws -> HTTPDiscIOReader? {
         let session = makeSession(sessionConfiguration)
+        handle?.attach(session)
+        defer { handle?.detach() }
         switch resolveSize(url: url, extraHeaders: extraHeaders, session: session,
                            requestTimeout: requestTimeout, maxRetries: maxRetries,
-                           knownSize: prewarmed?.contentLength) {
+                           knownSize: prewarmed?.contentLength, shouldAbort: handle.map { h in { h.isCancelled } }) {
         case .size(let size):
             return HTTPDiscIOReader(
                 url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
-                maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
+                maxChunkSize: maxChunkSize, streamRangeSize: streamRangeSize,
+                maxRetries: maxRetries, requestTimeout: requestTimeout,
                 session: session, totalSize: size,
                 residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [])
         case .ignoresRange:
@@ -115,6 +165,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                  extraHeaders: [String: String],
                  baseChunkSize: Int,
                  maxChunkSize: Int,
+                 streamRangeSize: Int,
                  maxRetries: Int,
                  requestTimeout: TimeInterval,
                  session: URLSession,
@@ -125,6 +176,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         self.baseChunkSize = max(64 * 1024, baseChunkSize)
         self.maxChunkSize = max(max(64 * 1024, baseChunkSize), maxChunkSize)
         self.currentChunkSize = max(64 * 1024, baseChunkSize)
+        self.streamRangeSize = streamRangeSize
         self.maxRetries = max(0, maxRetries)
         self.requestTimeout = requestTimeout
         self.session = session
@@ -146,10 +198,10 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     /// small file of a disc folder, read whole, where a range-blind origin costs nothing.
     private static func resolveSize(url: URL, extraHeaders: [String: String], session: URLSession,
                                     requestTimeout: TimeInterval, maxRetries: Int,
-                                    knownSize: Int64?) -> SizeProbe {
+                                    knownSize: Int64?, shouldAbort: (() -> Bool)? = nil) -> SizeProbe {
         if let knownSize, knownSize > 0 { return .size(knownSize) }
         return probeSize(url: url, extraHeaders: extraHeaders, session: session,
-                         timeout: requestTimeout, maxRetries: max(0, maxRetries))
+                         timeout: requestTimeout, maxRetries: max(0, maxRetries), shouldAbort: shouldAbort)
     }
 
     /// #647: take what a host warmed for this URL, under the rule `AVIOReader` adopts by (#551).
@@ -183,19 +235,12 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
 
     /// Total size from a `Content-Range` value (`bytes 0-0/12345` -> 12345). Nil for `*` or junk.
     static func parseContentRangeTotal(_ value: String) -> Int64? {
-        guard let slash = value.lastIndex(of: "/") else { return nil }
-        let total = value[value.index(after: slash)...].trimmingCharacters(in: .whitespaces)
-        guard total != "*" else { return nil }
-        return Int64(total)
+        ContentRange(value)?.total
     }
 
     /// Start offset from a `Content-Range` value (`bytes 100-200/12345` -> 100). Nil for junk.
     static func parseContentRangeStart(_ value: String) -> Int64? {
-        let trimmed = value.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("bytes ") else { return nil }
-        let rest = trimmed.dropFirst("bytes ".count)
-        guard let dash = rest.firstIndex(of: "-") else { return nil }
-        return Int64(rest[rest.startIndex..<dash])
+        ContentRange(value)?.start
     }
 
     /// Next adaptive window: `base` when `position` is not the sequential continuation of the last
@@ -211,6 +256,10 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     func read(_ outBuffer: UnsafeMutablePointer<UInt8>?, size n: Int32) -> Int32 {
         guard let out = outBuffer, n > 0 else { return -1 }
         lock.lock(); defer { lock.unlock() }
+        return read(locked: out, size: n)
+    }
+
+    private func read(locked out: UnsafeMutablePointer<UInt8>, size n: Int32) -> Int32 {
         if position >= totalSize { return 0 }
 
         if let span = residentSpans.first(where: { $0.covers(position) }) {
@@ -226,12 +275,38 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             return Int32(toCopy)
         }
 
+        if let s = stream {
+            if s.skip(to: position), position < s.end {
+                let got = s.read(into: out, size: min(Int(n), Int(totalSize - position)))
+                guard got > 0 else {
+                    dropStreamLocked()
+                    return -1
+                }
+                position += Int64(got)
+                lastFetchEnd = position
+                return Int32(got)
+            }
+            // A seek away from the stream, or its end (a warmed span or EOF): the window decides
+            // afresh, so a jump starts small again and a continuation streams again.
+            if s.position != position { lastFetchEnd = -1 }
+            dropStreamLocked()
+        }
+
         if position < bufferStart || position >= bufferStart + Int64(buffer.count) {
             currentChunkSize = Self.nextChunkSize(
                 position: position, lastFetchEnd: lastFetchEnd,
                 current: currentChunkSize, base: baseChunkSize, maxChunk: maxChunkSize)
             // Stop at the next warmed span: its bytes are already here.
             let limit = residentSpans.lazy.map(\.start).filter { $0 > self.position }.min() ?? totalSize
+            if Self.streams(position: position, lastFetchEnd: lastFetchEnd, nextChunk: currentChunkSize,
+                            maxChunk: maxChunkSize, streamRange: streamRangeSize,
+                            playback: playbackStreaming),
+               limit - position > Int64(maxChunkSize) {
+                guard startStreamLocked(end: limit) else { return -1 }
+                buffer = []
+                bufferStart = -1
+                return read(locked: out, size: n)
+            }
             let want = Int(min(Int64(currentChunkSize), limit - position))
             guard want > 0, let data = fetchWithRetry(offset: position, length: want), !data.isEmpty else {
                 return -1
@@ -267,16 +342,63 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         return target
     }
 
-    func close() { session.invalidateAndCancel() }
+    func close() {
+        cancelLock.lock(); let s = cancellableStream; cancellableStream = nil; cancelLock.unlock()
+        s?.close()
+        session.invalidateAndCancel()
+    }
 
     func cancel() {
-        cancelLock.lock(); cancelled = true; cancelLock.unlock()
+        cancelLock.lock(); cancelled = true; let s = cancellableStream; cancelLock.unlock()
+        s?.close()
         session.getAllTasks { $0.forEach { $0.cancel() } }
+    }
+
+    /// True when the refill at `position` is a sequential continuation that reaches the top of the
+    /// adaptive window, which is where disc discovery has ended and playback has begun (#1007).
+    /// Once `playback` is set any sequential continuation streams: the first read after a seek
+    /// still goes through the small adaptive fetch, so the demuxer's seek bisection stays cheap.
+    static func streams(position: Int64, lastFetchEnd: Int64, nextChunk: Int, maxChunk: Int,
+                        streamRange: Int, playback: Bool = false) -> Bool {
+        streamRange > maxChunk && position == lastFetchEnd && lastFetchEnd >= 0
+            && (nextChunk >= maxChunk || playback)
+    }
+
+    private func startStreamLocked(end: Int64) -> Bool {
+        let s = ProgressiveRangeStream(
+            url: url, extraHeaders: extraHeaders, session: session, timeout: requestTimeout,
+            start: position, end: end, rangeSize: streamRangeSize, watermark: maxChunkSize,
+            maxRetries: maxRetries) { [weak self] bytes in
+                guard let self, bytes > 0 else { return }
+                self.transferLock.lock(); self.transferredBytes &+= Int64(bytes); self.transferLock.unlock()
+                Self.recordFetched(bytes: bytes)
+            }
+        cancelLock.lock()
+        let stop = cancelled
+        if !stop { cancellableStream = s }
+        cancelLock.unlock()
+        if stop {
+            s.close()
+            return false
+        }
+        stream = s
+        playbackStreaming = true
+        return true
+    }
+
+    private func dropStreamLocked() {
+        guard let s = stream else { return }
+        stream = nil
+        cancelLock.lock()
+        if cancellableStream === s { cancellableStream = nil }
+        cancelLock.unlock()
+        s.close()
     }
 
     func makeIndependentReader() -> IOReader? {
         HTTPDiscIOReader(url: url, extraHeaders: extraHeaders,
                          baseChunkSize: baseChunkSize, maxChunkSize: maxChunkSize,
+                         streamRangeSize: streamRangeSize,
                          maxRetries: maxRetries, requestTimeout: requestTimeout,
                          session: Self.makeSession(nil),
                          totalSize: totalSize, residentSpans: residentSpans)
@@ -320,11 +442,20 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     }
 
     private static func probeSize(url: URL, extraHeaders: [String: String], session: URLSession,
-                                  timeout: TimeInterval, maxRetries: Int) -> SizeProbe {
+                                  timeout: TimeInterval, maxRetries: Int,
+                                  shouldAbort: (() -> Bool)? = nil) -> SizeProbe {
         var attempt = 0
         while true {
+            if shouldAbort?() == true { return .unreachable }
+            // Audit DMX-201: the probe is a request to the origin like any other, so it takes a slot
+            // and cannot compete uncounted with the next item's pump. A stopped open gives its place up.
+            let ticket = OriginRequestBudget.shared.acquire(
+                for: url, label: "disc-probe", timeout: timeout, shouldAbort: shouldAbort)
+            defer { OriginRequestBudget.shared.release(ticket) }
+            if shouldAbort?() == true { return .unreachable }
             let r = rangeGet(url: url, extraHeaders: extraHeaders, session: session,
                              timeout: timeout, offset: 0, length: 1)
+            if shouldAbort?() == true { return .unreachable }
             if let r = r, r.status == 206, let cr = r.contentRange,
                let total = parseContentRangeTotal(cr) {
                 return .size(total)
@@ -349,7 +480,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         }
     }
 
-    private struct RangeResponse {
+    struct RangeResponse {
         let status: Int
         let contentRange: String?
         let body: Data
@@ -375,7 +506,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     /// "URLSession retains completed completion-handler bodies until invalidation" reading of the
     /// AVIOReader leak (see `AVIOReader.persistentSession`): the owner was always the caller
     /// thread's pool, and delegate-based delivery fixed that path by keeping the body off it.
-    private static func rangeGet(url: URL, extraHeaders: [String: String], session: URLSession,
+    static func rangeGet(url: URL, extraHeaders: [String: String], session: URLSession,
                                  timeout: TimeInterval, offset: Int64, length: Int) -> RangeResponse? {
         autoreleasepool {
             var req = URLRequest(engineURL: url, timeoutInterval: timeout)

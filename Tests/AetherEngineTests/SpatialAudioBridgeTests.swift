@@ -177,9 +177,9 @@ struct SpatialAudioBridgeTests {
             #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == .l714)
             #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_DTS, profile: profile) == .dtsHDMasterAudio)
         }
-        // Only layouts that carry the 7.1 bed and the four heights one to one.
+        // Only into layouts that carry the 7.1 bed and the four heights one to one; a smaller one gets 7.1.4.
         for layout in SpatialSpeakerLayout.allCases {
-            let expected: SpatialSpeakerLayout? = layout == .l714 || layout == .l916 ? layout : nil
+            let expected: SpatialSpeakerLayout = layout == .l916 ? .l916 : .l714
             #expect(HLSVideoEngine.spatialRenderingLayout(
                 rendering: .apac(layout), codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X,
                 sampleRate: 48_000) == expected, "\(layout.rawValue)")
@@ -518,7 +518,11 @@ struct SpatialAudioBridgeTests {
             Issue.record("the stand-in needs no parsed packet, so the cut completes")
             return nil
         }
-        return (try #require(initBytes), segment, sessionDir)
+        // Completed staging still belongs to the muxer until adopted. The fixture owns
+        // the moved file, just as SegmentCache.adopt does in a playback session.
+        let adopted = sessionDir.appendingPathComponent("probe.m4s")
+        try FileManager.default.moveItem(at: segment, to: adopted)
+        return (try #require(initBytes), adopted, sessionDir)
     }
 
     #endif
@@ -974,6 +978,29 @@ extension SpatialAudioBridgeTests {
         let first = try #require(after.first)
         let expected = 60.0 - Double(bridge.encoderLeadingFrames) / Double(SpatialAudioBridge.sampleRate)
         #expect(abs(first - expected) < 0.001, "first buffer at \(first) s, expected \(expected) s")
+    }
+
+    /// AE#1026: the software host reads `LiveTelemetry.objectAudio` from its producer. The APAC
+    /// producer has to hand on its bridge's activity, a PCM decode has none to give.
+    @Test("the software host's APAC producer reports its bridge's object activity, a PCM decode none")
+    func softwareProducerReportsObjectActivity() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let bridge = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l512, decoder: ClickDecoder(clickFrame: .max),
+            format: .lpcm)
+        let stream = UnsafeMutablePointer<AVStream>.allocate(capacity: 1)
+        stream.initialize(to: AVStream())
+        defer { stream.deallocate() }
+        let producer = SoftwareAPACProducer(bridge: bridge, stream: stream)
+        defer { producer.close() }
+
+        _ = feedProducer(producer, startMs: 0, count: 50, epoch: producer.feedEpoch)
+        let activity = try #require(producer.objectAudioActivity)
+        #expect(activity.layout == .l512)
+        #expect(activity == bridge.objectAudioActivity)
+
+        let pcm: any SoftwareAudioProducing = AudioDecoder()
+        #expect(pcm.objectAudioActivity == nil)
     }
 }
 #endif

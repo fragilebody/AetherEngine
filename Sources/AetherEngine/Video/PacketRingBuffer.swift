@@ -39,10 +39,15 @@ final class PacketRingBuffer: @unchecked Sendable {
     static let minimumLiveByteBudget = 64 << 20
 
     /// The native path's retention funnel (min(2 GiB, a quarter of free space)) with the live floor.
-    static func liveByteBudget(volumeAvailableBytes: Int64?, capRelaxed: Bool = false) -> Int {
+    /// A host's explicit `LoadOptions.liveDVRByteBudget` replaces the 2 GiB default and keeps the
+    /// quarter-of-free-space clamp: a window meant to hold a whole recording in progress (hours of
+    /// broadcast MPEG-2) does not fit in 2 GiB.
+    static func liveByteBudget(volumeAvailableBytes: Int64?, capRelaxed: Bool = false,
+                               requestedBytes: Int? = nil) -> Int {
         max(minimumLiveByteBudget,
-            HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: volumeAvailableBytes,
-                                                       capRelaxed: capRelaxed))
+            HLSVideoEngine.resolveSessionCacheBudget(requestedBytes: requestedBytes,
+                                                     volumeAvailableBytes: volumeAvailableBytes,
+                                                     capRelaxed: capRelaxed).baseEffectiveBytes)
     }
 
     // MARK: - Private types
@@ -501,20 +506,6 @@ final class PacketRingBuffer: @unchecked Sendable {
             return nil
         }
         return entries[idx].pts
-    }
-
-    /// The oldest position a rewind can land on, on the session axis, once eviction has taken history
-    /// the window alone would have kept. nil until then, so a young session keeps its window arithmetic.
-    /// Audit VPERF-101: the byte budget can shrink the ring below `windowSeconds`, and the transport rail
-    /// must not advertise history that was evicted for space.
-    func residentFloorSessionSeconds(sessionStartPts: Double) -> Double? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard firstSeq > 0, sessionStartPts.isFinite,
-              keyframeHead < keyframeSeqs.count, let idx = indexLocked(keyframeSeqs[keyframeHead]) else {
-            return nil
-        }
-        return max(0, entries[idx].pts - sessionStartPts)
     }
 
     /// Bytes the retained chunk files occupy, including the evicted prefix of the oldest chunk.

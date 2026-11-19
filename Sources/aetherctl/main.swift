@@ -66,25 +66,32 @@ func printUsage() {
     aetherctl: standalone AetherEngine repro harness
 
     Usage:
-      aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
+      aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm|auto]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--fel [--fel-output]] [--upscale] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--standard-join] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl bench [--iterations N] [--json out.json] [--baseline base.json] [--tolerance PCT]
+      aetherctl bench --compare <base.json> <new.json> [--tolerance PCT]
+      aetherctl play [--fel [--fel-output]] [--upscale [--line-art]] [--tone-map NITS] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--standard-join] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
+                 [--subtitle-offset-reach SECONDS] [--subtitle-delay-reach SECONDS] [--subtitle-advance-reach SECONDS]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
                  [--audio-shaping <spec>] [--switch-audio-shaping <spec>[@ms]]...
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
-             [--max-concurrent-requests N] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]]
-                     [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
+             [--max-concurrent-requests N] [--atmos-bed 7.1.4 [--bed-format apac|lpcm|auto] [--no-dtsx-objects]]
+                     [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext,subsatload] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
                       a build with the DualLayerDolbyVision trait); --upscale opts into
-                      upscaling sub-1080p SDR video to the display (#846);
+                      upscaling sub-1080p SDR video to the display (#846),
+                      --line-art with the line-art scaler for animation, which
+                      also takes 1080p and 10-bit SDR (AE#1039);
+                      --tone-map NITS opts into the picture processing,
+                      tone mapping HDR10 brighter than NITS to it (#957);
                       --surface (or --window) presents
                       into a window; --cycle-el S flips the FEL residual every S
                       seconds, which needs --fel and a surface; --subs activates the first
@@ -120,6 +127,7 @@ func printUsage() {
       aetherctl eltype [--parallel N]      (label<TAB>url lines on stdin)
       aetherctl elsurvey [--parallel N] [--points N]   (label<TAB>url lines on stdin; DualLayerDolbyVision trait)
       aetherctl elframe --at SECONDS --out DIR <url>   (DualLayerDolbyVision trait)
+      aetherctl felcurves <url> <out.rpu>              (FEL folded into per-scene P8.1 curves; DolbyVisionFelCurves trait)
       aetherctl extract [--at <sec>] [--preview|--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue] <url>
@@ -133,7 +141,7 @@ func printUsage() {
                      [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N] [--live-only] [--no-blocking-reload] [--force-master]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
-      aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N] [--target-duration N] [--window N]
+      aetherctl hlsfixture (<input.ts> | --segments-dir <dir>) [--port N] [--segment-seconds N] [--target-duration N] [--window N]
                            [--master] [--discontinuity-at N] [--slow-refresh]
                            [--drop-segment N] [--encrypted] [--fmp4] [--self-test]
       aetherctl hlslive --segments a.ts,b.ts,c.ts [--seconds N] [--segment-seconds N] [--disc i,j]
@@ -297,6 +305,8 @@ func printUsage() {
                 OK if the clock advanced or FAIL if it stayed silent.
                 Smoke-tests the FFmpeg decode -> AVSampleBufferAudioRenderer
                 pipeline end-to-end on macOS without a display layer.
+                --gain DB sets LoadOptions.normalizationGainDB and prints
+                the engine's normalization report before stopping.
 
       live      Start a synthetic endless MPEG-TS source (LiveFixture,
                 loopback HTTP, no Content-Length, monotonic PTS / PCR
@@ -320,7 +330,8 @@ func printUsage() {
 // MARK: - Object audio
 
 /// `--atmos-bed 7.1.4`: TrueHD Atmos or DTS:X rendered into that bed and delivered as APAC
-/// (`LoadOptions.objectAudioRendering`, #731), or with `--bed-format lpcm` as 24-bit PCM. Without it
+/// (`LoadOptions.objectAudioRendering`, #731), with `--bed-format lpcm` as 24-bit PCM, with `auto` as the
+/// route picks (`.render`). Without it
 /// the channel bridge plays them.
 private func objectAudioRendering(_ flag: String?, format: String? = nil) -> ObjectAudioRendering {
     guard let flag else { return .off }
@@ -331,11 +342,18 @@ private func objectAudioRendering(_ flag: String?, format: String? = nil) -> Obj
     #if !(TrueHDObjectAudio || DTSXObjectAudio)
     print("[aetherctl] note: --atmos-bed renders nothing without the TrueHDObjectAudio / DTSXObjectAudio traits")
     #endif
+    #if DEBUG
+    // A debug build renders the bed about 5x slower than real time (Unfold: 18.8 s against 2.0 s), so
+    // AVPlayer waits for audio and `play` ends in "clock did not advance". Not an engine defect.
+    print("[aetherctl] note: a debug build renders the object bed below real time, so play may stall; "
+        + "build with -c release to judge playback")
+    #endif
     switch format {
     case nil, "apac": return .apac(layout)
     case "lpcm": return .lpcm(layout)
+    case "auto": return .render(layout)
     default:
-        print("ERROR: --bed-format expects apac or lpcm, got '\(format!)'")
+        print("ERROR: --bed-format expects apac, lpcm or auto, got '\(format!)'")
         exit(64)
     }
 }
@@ -619,7 +637,50 @@ if first == "elsurvey" {
     rejectStrayFlags(rest, subcommand: "elsurvey")
     exit(runElSurvey(parallel: parallel, points: points))
 }
+#else
+if first == "elframe" || first == "elsurvey" {
+    print("ERROR: \(first) needs the DualLayerDolbyVision trait (swift build --traits DualLayerDolbyVision)")
+    exit(64)
+}
 #endif
+
+#if DolbyVisionFelCurves
+// A FEL source folded into the luma curve of its Profile 8.1 RPUs (mapping kept), written out: felcurves <url> <out.rpu>.
+if first == "felcurves" {
+    let rest = Array(args.dropFirst(2))
+    guard rest.count == 2 else {
+        print("Usage: aetherctl felcurves <url> <out.rpu>")
+        exit(64)
+    }
+    exit(runFelCurves(url: parseSourceURL(rest[0]), outPath: rest[1]))
+}
+#else
+if first == "felcurves" {
+    print("ERROR: felcurves needs the DolbyVisionFelCurves trait (swift build --traits DolbyVisionFelCurves)")
+    exit(64)
+}
+#endif
+
+// Per-frame cost of the software path's frame work, against a baseline (AE#957).
+if first == "bench" {
+    var rest = Array(args.dropFirst(2))
+    let iterations = takeIntFlag("--iterations", in: 10...100_000, from: &rest) ?? 300
+    let jsonPath = takeStringFlag("--json", from: &rest)
+    let baseline = takeStringFlag("--baseline", from: &rest)
+    let tolerance = (takeDoubleFlag("--tolerance", in: 1...500, from: &rest) ?? 20) / 100
+    var compare: (String, String)?
+    if takeFlag("--compare", from: &rest) {
+        guard rest.count == 2 else {
+            print("Usage: aetherctl bench --compare <base.json> <new.json> [--tolerance PCT]")
+            exit(64)
+        }
+        compare = (rest[0], rest[1])
+        rest.removeAll()
+    }
+    rejectStrayFlags(rest, subcommand: "bench")
+    exit(runBench(iterations: iterations, jsonPath: jsonPath, baselinePath: baseline, tolerance: tolerance,
+                  compare: compare))
+}
 
 // FEL / MEL for many sources at once: `label<TAB>url` lines on stdin.
 if first == "eltype" {
@@ -840,7 +901,18 @@ if first == "play" {
     // software host's (needs --fel).
     let playFelOutput = takeFlag("--fel-output", from: &rest)
     // #846: `LoadOptions.upscalesLowResolutionVideo`, off by default as in the engine.
-    let playUpscale = takeFlag("--upscale", from: &rest)
+    // AE#1039: `LoadOptions.upscaleScaler = .lineArt`; implies --upscale.
+    let playLineArt = takeFlag("--line-art", from: &rest)
+    let playUpscale = takeFlag("--upscale", from: &rest) || playLineArt
+    // #957: `LoadOptions.videoProcessing` with this target peak; off by default as in the engine.
+    var playVideoProcessing: VideoProcessingOptions?
+    if let spec = takeStringFlag("--tone-map", from: &rest) {
+        guard let nits = Double(spec), nits.isFinite, nits > 0 else {
+            print("ERROR: --tone-map takes a target peak in nit above 0, got '\(spec)'")
+            exit(64)
+        }
+        playVideoProcessing = VideoProcessingOptions(targetPeakNits: nits)
+    }
     // `LoadOptions.videoDither` with its defaults (fruit matrix, 10 bits), off by default as in the engine.
     let playDither = takeFlag("--dither", from: &rest)
     // `LoadOptions.videoDeband` with mpv's defaults, off by default as in the engine.
@@ -944,6 +1016,8 @@ if first == "play" {
     // #731: TrueHD Atmos or DTS:X rendered into a bed as APAC; the 1 Hz line then reports its objects.
     let playObjectAudio = objectAudioRendering(
         takeStringFlag("--atmos-bed", from: &rest), format: takeStringFlag("--bed-format", from: &rest))
+    // AE#1060: TrueHD Atmos renders, DTS keeps the 7.1 channel bridge.
+    let playRendersDTSX = !takeFlag("--no-dtsx-objects", from: &rest)
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -983,6 +1057,11 @@ if first == "play" {
                                   delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20) : 20)
     }
     let teletextPage = takeIntFlag("--teletext-page", from: &rest)
+    // AE#1031: the two directions can be set apart; a direction left out keeps the offset reach.
+    let subtitleReach = SubtitleReachRequest(
+        offset: takeDoubleFlag("--subtitle-offset-reach", in: 0...600, from: &rest),
+        delay: takeDoubleFlag("--subtitle-delay-reach", in: 0...600, from: &rest),
+        advance: takeDoubleFlag("--subtitle-advance-reach", in: 0...600, from: &rest))
     // #364: `<page|auto>[@ms]`. The default delay is 20 s, not the audio switch's 20 ms: this one has
     // to land on a channel that is already showing a teletext track, else the run proves nothing the
     // load option did not already prove.
@@ -1018,11 +1097,12 @@ if first == "play" {
             delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
     }
     // AE#923: `--audio-shaping <spec>` is the load option, `--switch-audio-shaping <spec>[@ms]` the
-    // runtime setter. A spec is `off` or a comma list of `ch=N`, `dialogue=DB`, `night`.
+    // runtime setter. A spec is `off` or a comma list of `ch=N`, `dialogue=DB`, `night`, `gain=DB`,
+    // `loudness=LUFS`, `lfe=DB`.
     var audioShaping = AudioShaping()
     if let spec = takeStringFlag("--audio-shaping", from: &rest) {
         guard let parsed = parseAudioShapingSpec(spec) else {
-            print("ERROR: --audio-shaping takes off or ch=N,dialogue=DB,night; got '\(spec)'")
+            print("ERROR: --audio-shaping takes off or ch=N,dialogue=DB,night,gain=DB,loudness=LUFS,lfe=DB; got '\(spec)'")
             exit(64)
         }
         audioShaping = parsed
@@ -1045,6 +1125,9 @@ if first == "play" {
     // AE#956: LoadOptions.skipsContainerAttachments. Pair it with a throttled origin and an MKV that
     // carries fonts to see the open stop paying for them.
     let skipAttachments = takeFlag("--skip-attachments", from: &rest)
+    // AE#682: LoadOptions.serveIFramePlaylist on a full session, where the still ladder runs and
+    // fills the rendition ahead of AVKit (`[StillLadder] reading through the I-frame rendition`).
+    let playServesIFrames = takeFlag("--iframes", from: &rest)
     // #460: `--reload-applying <key>=<value>`, repeatable, with one shared delay. The delay is a
     // separate flag rather than teletext's `@ms` suffix because a header value can carry an `@`.
     // Default +20 s for the same reason the teletext switch uses it: the correction has to land on
@@ -1167,6 +1250,7 @@ if first == "play" {
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
+                 subtitleReach: subtitleReach,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
                  audioShaping: audioShaping, audioShapingSwitches: audioShapingSwitches,
                  pausedMount: pausedMount,
@@ -1175,16 +1259,20 @@ if first == "play" {
                  heldConnection: heldConnection,
                  progressiveSegments: progressiveSegments,
                  objectAudioRendering: playObjectAudio,
+                 rendersDTSX: playRendersDTSX,
                  declaredDuration: declaredDuration,
                  httpHeaders: playHeaders,
                  deinterlaceFieldRate: playFieldRate,
                  assertDolbyVision: playAssertDV,
                  preserveASSMarkup: preserveASSMarkup,
                  skipAttachments: skipAttachments,
+                 serveIFrames: playServesIFrames,
                  dolbyVisionHandling: playDVHandling,
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
                  dualLayerRoute: playFelOutput ? .avPlayerOutput : .softwareHost,
                  upscalesLowResolutionVideo: playUpscale,
+                 upscaleScaler: playLineArt ? .lineArt : .automatic,
+                 videoProcessing: playVideoProcessing,
                  videoDither: playDither ? VideoDitherOptions() : nil,
                  videoDeband: playDeband ? VideoDebandOptions() : nil,
                  attachSurface: playAttachSurface,
@@ -1209,6 +1297,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     var probeDetail: ProbeDetail = []
     if takeFlag("--detect-hdr10plus", from: &rest) { probeDetail.insert(.hdr10Plus) }
     if takeFlag("--detect-hdr-vivid", from: &rest) { probeDetail.insert(.hdrVivid) }
+    if takeFlag("--detect-dv-el", from: &rest) { probeDetail.insert(.dolbyVisionEnhancementLayer) }
     if takeFlag("--detect-atmos", from: &rest) { probeDetail.insert(.atmos) }
     let inMemory = takeFlag("--memory", from: &rest)
     let forwardOnly = takeFlag("--forward-only", from: &rest)
@@ -1279,6 +1368,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let extractFlag = takeFlag("--extract", from: &rest)
     let secondsFlag = takeDoubleFlag("--seconds", in: 0...maxRunSeconds, from: &rest)
     let audioSeconds = secondsFlag ?? 10
+    let audioGain = takeDoubleFlag("--gain", from: &rest)   // Sodalite#242
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
     // AE#682: list an I-frame rendition in the master; serve only.
@@ -1336,7 +1426,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
             maxWidth: extractWidth
         ))
     case "audio":
-        exit(runAudio(url: url, seconds: audioSeconds))
+        exit(runAudio(url: url, seconds: audioSeconds, gainDB: audioGain))
     case "customio":
         if customLive {
             exit(runCustomLiveSpool(path: urlArg, seconds: secondsFlag ?? 720, rateKbps: customRateKbps,

@@ -106,6 +106,8 @@ extension AetherEngine {
             return
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }  // unknown external id: no-op
+        // A stream index is a non-negative Int32; anything else would trap the conversion below (audit SUB-207).
+        guard let streamIndex = Int32(exactly: index), streamIndex >= 0 else { return }
         guard loadedURL != nil else { return }
 
         // #77: in-band CEA-608/708 is fed by the always-on producer CC tap (set up at load), not a side
@@ -117,7 +119,7 @@ extension AetherEngine {
             cancelSidecarTask()
             clearSubtitleDrainTarget(channel: .primary, reason: .closedCaptionsSelected)   // #112 rework: CC is tap-fed, not drained
             isSubtitleActive = true
-            activeEmbeddedSubtitleStreamIndex = Int32(index)
+            activeEmbeddedSubtitleStreamIndex = streamIndex
             activeSubtitleTrackIndex = index
             isLoadingSubtitles = false
             subtitleCues = ccCueSnapshot
@@ -132,9 +134,9 @@ extension AetherEngine {
         isSubtitleActive = true
         subtitleCues = []
         pgsStaleArrivalGates[.primary]?.reset()   // #100
-        activeEmbeddedSubtitleStreamIndex = Int32(index)
+        activeEmbeddedSubtitleStreamIndex = streamIndex
         activeSubtitleTrackIndex = index
-        subtitleDrainTargets[.primary] = Int32(index)
+        subtitleDrainTargets[.primary] = streamIndex
         subtitleDrainDecoders[.primary] = nil
         subtitleDrainCursors[.primary] = nil
         // Phase D: a bitmap track additionally arms the OCR worker feeding its native rendition, but
@@ -144,7 +146,7 @@ extension AetherEngine {
         if nativeSubtitleRenderingRequested, !keepsOCRWorker,
            let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
            nativeSubtitleTrackTable[ordinal].needsOCR {
-            startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(index))
+            startSubtitleOCRWorker(ordinal: ordinal, streamIndex: streamIndex)
         }
         startSubtitleDrainer()
         startSubtitleForwardPrefetcher(startAt: startAt)   // #151
@@ -218,9 +220,11 @@ extension AetherEngine {
             return
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }
+        guard let streamIndex = Int32(exactly: index), streamIndex >= 0 else { return }  // audit SUB-207
         guard loadedURL != nil else { return }
         cancelSidecarTask(channel: .secondary)
         loadedSecondarySidecarURL = nil
+        loadedSecondarySidecarHeaders = nil
 
         // #112 rework: secondary embedded tracks ride the same packet-store drainer on their
         // own channel; the immediate tick backfills it.
@@ -228,13 +232,13 @@ extension AetherEngine {
         secondarySubtitleCues = []
         secondarySidecarASSHeader = nil
         pgsStaleArrivalGates[.secondary]?.reset()   // #100
-        subtitleDrainTargets[.secondary] = Int32(index)
+        subtitleDrainTargets[.secondary] = streamIndex
         subtitleDrainDecoders[.secondary] = nil
         subtitleDrainCursors[.secondary] = nil
         startSubtitleDrainer()
         startSubtitleForwardPrefetcher(startAt: startAt)   // #151
         isLoadingSecondarySubtitles = false
-        setSecondarySubtitleIdentity(embedded: Int32(index))
+        setSecondarySubtitleIdentity(embedded: streamIndex)
     }
 
 
@@ -296,6 +300,11 @@ extension AetherEngine {
         startSubtitleDrainer()
     }
 
+    /// AE#1006: a `.sup` from a UHD disc carries the same PQ palette as the disc's own tracks.
+    var sourceIsPQForBitmapSubtitles: Bool {
+        sourceVideoStreamFormat?.transfer == av_color_transfer_name(AVCOL_TRC_SMPTE2084).map { String(cString: $0) }
+    }
+
     /// Drop a channel's bitmap sidecar together with the drain target pointing at it.
     func releaseSidecarBitmapSource(channel: SubtitleChannel) {
         guard sidecarBitmapSources[channel] != nil else { return }
@@ -304,7 +313,9 @@ extension AetherEngine {
 
     /// Build a fresh overlay decoder for the stream on whichever host owns the session demuxer.
     func makeSubtitleDrainDecoder(channel: SubtitleChannel, streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
-        if let source = sidecarBitmapSources[channel] { return source.makeDecoder() }
+        if let source = sidecarBitmapSources[channel] {
+            return source.makeDecoder(sourceIsPQ: sourceIsPQForBitmapSubtitles)
+        }
         return makeSubtitleDrainDecoder(streamIndex: streamIndex)
     }
 
@@ -396,9 +407,9 @@ extension AetherEngine {
         activeSubtitlePacketStore?.setProtectedStreams(Set(embeddedSubtitleDrainTargets.values))
     }
 
-    /// The synchronous tick: plan, decode and apply in one go on the MainActor. Kept for the
-    /// teletext page change and for tests; the drain loop goes through `requestSubtitleDrainTick`,
-    /// which decodes off the MainActor (AE#628). Queued rather than run while that one is in flight.
+    /// The synchronous tick: plan, decode and apply in one go on the MainActor. Kept for tests;
+    /// the drain loop and the teletext page change go through `requestSubtitleDrainTick`, which
+    /// decodes off the MainActor (AE#628). Queued rather than run while that one is in flight.
     func subtitleDrainTick() {
         guard subtitleDrainTickInFlight == nil else {
             subtitleDrainTickRequested = true
@@ -412,6 +423,9 @@ extension AetherEngine {
     /// decode nothing (idle, no decoder), and hands back what the decode needs.
     func prepareSubtitleDrainTick() -> SubtitleDrainTickWork? {
         guard !subtitleDrainTargets.isEmpty else { return nil }
+        // AE#1022 round 3: nothing is planned between a software seek's closing and its landing.
+        // The loop's next tick after the landing is the reset that reconstructs it.
+        if isSeeking, subtitleDepartureClosedSeekGeneration == currentSeekGeneration { return nil }
         let sessionStore = activeSubtitlePacketStore
         sessionStore?.setProtectedStreams(Set(embeddedSubtitleDrainTargets.values))   // #166: re-assert protection
         let playhead = sourceTime
@@ -429,16 +443,26 @@ extension AetherEngine {
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         let elapsed = subtitleDrainLastTickUptime.map { tickUptime - $0 } ?? 0
         subtitleDrainLastTickUptime = tickUptime
-        var work = SubtitleDrainTickWork(playhead: playhead)
+        var work = SubtitleDrainTickWork(playhead: playhead, seekGeneration: currentSeekGeneration)
         for (channel, streamIndex) in subtitleDrainTargets {
             // #921: a sidecar channel drains its own store, which needs no session at all.
             guard let store = subtitlePacketStore(for: channel) else { continue }
             let isSidecar = sidecarBitmapSources[channel] != nil
+            // AE#1022: a refused landing whose ground has been read since is reconstructed. A nil
+            // cursor makes this tick the same reset a fresh selection gets, without reading as a
+            // jump, so the prefetch is not sent back to the landing it has just read.
+            if let start = subtitleLandingAwaitingGround[channel] {
+                let step = Self.landingGroundStep(
+                    awaitingStart: start, playhead: playhead,
+                    isRead: { store.hasReadSpan(from: $0, through: $1) })
+                if step != .keepWaiting { subtitleLandingAwaitingGround[channel] = nil }
+                if step == .reconstruct { subtitleDrainCursors[channel] = nil }
+            }
             let hadCursor = subtitleDrainCursors[channel] != nil
             let plan = SubtitleOverlayDrainer.drainPlan(
                 cursor: subtitleDrainCursors[channel],
                 playhead: playhead,
-                lead: Self.subtitleDrainLeadSeconds,
+                lead: subtitleDrainLead(for: channel, streamIndex: streamIndex),
                 backscan: Self.subtitleDrainBackscanSeconds,
                 jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
                 elapsedSinceLastPlan: elapsed)
@@ -467,6 +491,8 @@ extension AetherEngine {
                 window = (from, through)
             case .resetAndDecode(let from, let through):
                 isReset = true
+                // AE#1022: whatever this reset refuses is stated again by its own decode.
+                subtitleLandingAwaitingGround[channel] = nil
                 coverageStart = from
                 retained = SubtitleResolutionStatement.fold(retained, windowFrom: from)
                 subtitleDrainDecoders[channel] = nil
@@ -515,50 +541,23 @@ extension AetherEngine {
             // moving the cursor to its far side, which is how a stretch of the film loses its
             // subtitles entirely: after a seek the pump refills from behind the landing while an
             // island the previous run harvested sits further ahead, and the cursor never comes back.
-            // The hold is anchored on the near side and budgeted in ticks, so a boundary the harvest
-            // never closes costs a bounded delay and then decodes exactly as before.
-            var decodeEnd = batchEnd
-            var gapHoldAt: Double? = nil
-            var gapHoldSequence: UInt64 = 0
-            var gapHoldTicksLeft = 0
+            // #941: the ledger sees the holes order cannot, a forward re-anchor's above all. The
+            // playhead closing on the island is what ends a hold; see `harvestGapStep`.
             let held = subtitleDrainCursors[channel]
-            // #941: the ledger sees the holes order cannot, a forward re-anchor's above all.
-            let isRead = store.harvestReadCheck()
-            // The playhead closing on the island ends the hold whatever the budget says: from there
-            // on the island is what the viewer is about to need, and waiting would dark the overlay
-            // for content that IS stored. That, not the tick budget, is the real bound. #941: the
-            // island, not the hold position, which a refill at about 1x passes while the hole is
-            // still ahead of the playhead.
-            let releaseAt = playhead + Self.subtitleDrainHarvestGapReleaseLeadSeconds
-            if let heldAt = held?.harvestGapAt, let farSide = entries.first?.ptsSeconds, farSide > releaseAt,
-               (held?.harvestGapTicksLeft ?? 0) > 0, !isReset,
-               !SubtitleOverlayDrainer.harvestGapHoldResumes(
-                firstSequence: entries.first?.sequence,
-                heldSequence: held?.harvestGapSequence ?? 0,
-                firstPts: farSide, heldAt: heldAt, isRead: isRead) {
-                // Still waiting: the window past the hold begins with the same island as before.
-                decodeEnd = 0
-                gapHoldAt = heldAt
-                gapHoldSequence = held?.harvestGapSequence ?? 0
-                gapHoldTicksLeft = (held?.harvestGapTicksLeft ?? 0) - 1
-            } else if let cut = SubtitleOverlayDrainer.harvestGapCut(
+            let step = SubtitleOverlayDrainer.harvestGapStep(
                 count: batchEnd,
                 ptsAt: { entries[$0].ptsSeconds },
                 sequenceAt: { entries[$0].sequence },
-                resumeFrom: isReset ? nil : held.map { ($0.lastDecodedPts, $0.lastDecodedSequence) },
-                notBefore: releaseAt, isRead: isRead), held?.harvestGapAt != cut.at || (held?.harvestGapTicksLeft ?? 0) > 0 {
-                decodeEnd = cut.index
-                gapHoldAt = cut.at
-                gapHoldSequence = cut.sequence
-                gapHoldTicksLeft = held?.harvestGapAt == cut.at
-                    ? (held?.harvestGapTicksLeft ?? 0) - 1 : Self.subtitleDrainHarvestGapTicks
-            }
+                held: held?.harvestGap,
+                resumeFrom: held.map { ($0.lastDecodedPts, $0.lastDecodedSequence) },
+                isReset: isReset,
+                releaseAt: playhead + Self.subtitleDrainHarvestGapReleaseLeadSeconds,
+                isRead: store.harvestReadCheck())
             work.channels.append(SubtitleDrainChannelWork(
                 channel: channel, streamIndex: streamIndex, store: store, plan: plan, isReset: isReset,
                 window: window, coverageStart: coverageStart, retained: retained,
-                decoder: decoder, entries: entries, batchEnd: batchEnd, decodeEnd: decodeEnd,
-                gapHoldAt: gapHoldAt, gapHoldSequence: gapHoldSequence,
-                gapHoldTicksLeft: gapHoldTicksLeft))
+                decoder: decoder, entries: entries, batchEnd: batchEnd, decodeEnd: step.decodeEnd,
+                gapHold: step.hold))
         }
         return work
     }
@@ -568,6 +567,15 @@ extension AetherEngine {
     /// while its batch decoded is skipped: its cursor did not move, so the next tick redoes it.
     func finishSubtitleDrainTick(_ work: SubtitleDrainTickWork,
                                  events decodedByChannel: [[EmbeddedSubtitleDecoder.SubtitleEvent?]]) {
+        // AE#1022 round 3: a batch planned before a seek was decoded around the departure. Applied
+        // after it, it republished a set whose clear was unread as open, after the seek had closed
+        // it, and that set was drawn at the landing until the landing's reset closed it again
+        // (retest: the set of 22 s on screen for 0.37 s at a 63 s landing over a slow reader). The
+        // cursors did not move, so the tick after the landing decodes what still matters.
+        guard work.seekGeneration == currentSeekGeneration else {
+            subtitleDrainTickRequested = true
+            return
+        }
         let playhead = work.playhead
         for (job, events) in zip(work.channels, decodedByChannel) {
             let channel = job.channel
@@ -584,9 +592,7 @@ extension AetherEngine {
             let entries = job.entries
             let batchEnd = job.batchEnd
             let decodeEnd = job.decodeEnd
-            let gapHoldAt = job.gapHoldAt
-            let gapHoldSequence = job.gapHoldSequence
-            let gapHoldTicksLeft = job.gapHoldTicksLeft
+            let gapHold = job.gapHold
             // #271: bind the channel's cue array ONCE for the whole batch. `subtitleCues` is
             // `@Published`, whose wrapper exposes get/set and no `_modify`, so passing it inout per
             // event both copy-on-writes the array and publishes it: every consumer then walks a
@@ -643,9 +649,7 @@ extension AetherEngine {
                 lastPlayhead: playhead,
                 coverageStart: coverageStart ?? window.from,
                 retained: runRetained,
-                harvestGapAt: gapHoldAt,
-                harvestGapSequence: gapHoldSequence,
-                harvestGapTicksLeft: gapHoldTicksLeft)
+                harvestGap: gapHold)
             // #143/#204: a renderable composition at/after the playhead ends reconstruction while
             // decoding above. If the pass remains active with a candidate after the whole window,
             // finalize it. Raw packet presence cannot answer this: the landing line's own zero-object
@@ -657,9 +661,9 @@ extension AetherEngine {
             // #362: a hole hold is not a partial view of the landing. Holes are honoured only at or
             // after the playhead, so everything that can seed the candidate has decoded, and the
             // remainder sits beyond a gap the harvest has not closed. Waiting for that would keep
-            // the overlay dark for the whole hold budget, which is the one thing #143 exists to
+            // the overlay dark for the whole hold, which is the one thing #143 exists to
             // prevent; the successor trims the published line when the hole does fill.
-            if decodeEnd == entries.count || gapHoldAt != nil,
+            if decodeEnd == entries.count || gapHold != nil,
                SubtitleOverlayDrainer.shouldFinalizeReconstruction(
                 reconstructing: pgsStaleArrivalGates[channel]?.reconstructing ?? false,
                 hasCandidate: pgsStaleArrivalGates[channel]?.hasReconstructionCandidate ?? false) {
@@ -679,7 +683,7 @@ extension AetherEngine {
                 }
             }
             tally.reconstructing = pgsStaleArrivalGates[channel]?.reconstructing ?? false
-            tally.harvestGapAt = gapHoldAt
+            tally.harvestGapAt = gapHold?.at
             // #362: every bitmap cue takes its end from the next packet the store holds on this
             // stream. Run over the whole retained array rather than this batch's cues: a set left
             // open by an earlier tick (its successor not harvested yet, the batch cap, the window's
@@ -702,7 +706,8 @@ extension AetherEngine {
             // authored one.
             let derivationHorizon = window.through + Self.subtitleForwardPrefetchLeadMarginSeconds
             if Self.alignCueEnds(&cues, toNextPacket: {
-                guard let pts = store.firstPTS(streamIndex: streamIndex, after: $0) else { return nil }
+                guard let pts = Self.authoredSuccessorPTS(in: store, streamIndex: streamIndex,
+                                                          afterCueStart: $0) else { return nil }
                 guard pts <= derivationHorizon else {
                     tally.endsWithheld += 1
                     return nil
@@ -720,11 +725,14 @@ extension AetherEngine {
                 // AE#929: a cue the cursor has not reached yet is decoded again on the way, so past
                 // the lead it costs nothing to drop. After a backward seek that is the old
                 // position's whole floor and lead, which otherwise stays until playback gets there.
-                let reDecodedAfter = max(playhead + Self.subtitleDrainLeadSeconds
+                // AE#929: both edges follow the host's declared offset reach. AE#1031: the lead
+                // follows `maximumSubtitleAdvanceSeconds`, the floor `maximumSubtitleDelaySeconds`.
+                let reDecodedAfter = max(playhead + subtitleDrainLead(for: channel, streamIndex: streamIndex)
                                              + Self.subtitleForwardPrefetchLeadMarginSeconds,
                                          subtitleDrainCursors[channel]?.lastDecodedPts ?? .infinity)
-                if Self.pruneCues(&cues, toBitmapBytes: Self.subtitleCueBitmapByteBudget,
-                                  endedBefore: playhead - Self.subtitleCueBitmapFloorSeconds,
+                if Self.pruneCues(&cues, toBitmapBytes: bitmapCueHistoryByteBudget,
+                                  endedBefore: playhead - Self.bitmapCueFloorSeconds(
+                                      offsetReach: bitmapSubtitleHistoryReach),
                                   startingAfter: reDecodedAfter) {
                     didMutate = true
                 }
@@ -780,10 +788,66 @@ extension AetherEngine {
     /// #151: forward prefetch runs for VOD sessions only (live content past the edge does not
     /// exist and the pump already rides it), needs an embedded drain target (external/sidecar
     /// tracks hold whole files, CC is tap-fed) and a loaded source to open a side demuxer on.
-    nonisolated static func shouldRunSubtitleForwardPrefetch(
-        isLive: Bool, hasEmbeddedDrainTargets: Bool, hasSource: Bool
-    ) -> Bool {
-        !isLive && hasEmbeddedDrainTargets && hasSource
+    ///
+    /// AE#1015: and it needs something to serve. On an interleaved container the side reader
+    /// downloads the video a second time (measured: 104.5 MB against 243.6 MB for a minute of
+    /// 1080p MKV, the same for MP4), and the cues it buys are the ones beyond the pump's few
+    /// seconds of forward park, which only an advance offset or the OCR worker ever reads. A host
+    /// that declared no offset reach and has no negative software delay gets the pump's harvest,
+    /// which is exactly what a zero or positive offset consumes. The lead length is no lever: the
+    /// reader is sequential, so a shorter lead reads the same bytes, only later.
+    ///
+    /// AE#1022: without an advance a bitmap track still gets the reader, in its landing role. The
+    /// pump cannot read or prove the ground behind a seek landing (see
+    /// `SubtitleForwardPrefetcher.LandingWindow`), so a PGS line a seek lands inside stayed dark at
+    /// a reach of 0. A text track needs no landing read: the #416 ground check is for bitmap sets,
+    /// whose end comes from the next composition rather than from the cue itself.
+    nonisolated static func subtitleForwardPrefetchRole(
+        isLive: Bool, hasEmbeddedDrainTargets: Bool, hasSource: Bool,
+        advanceReach: Double, ocrArmed: Bool, hasBitmapDrainTarget: Bool
+    ) -> SubtitleForwardPrefetchRole? {
+        guard !isLive, hasEmbeddedDrainTargets, hasSource else { return nil }
+        if ocrArmed || advanceReach > 0 { return .readAhead }
+        return hasBitmapDrainTarget ? .landingWindow : nil
+    }
+
+    /// AE#1022: one of the selected embedded tracks decodes bitmap cues.
+    var hasEmbeddedBitmapDrainTarget: Bool {
+        embeddedSubtitleDrainTargets.contains {
+            subtitleDrainChannelIsBitmap($0.key, streamIndex: $0.value)
+        }
+    }
+
+    /// The role the forward prefetch should run in right now, nil when it should not run.
+    var wantedSubtitleForwardPrefetchRole: SubtitleForwardPrefetchRole? {
+        Self.subtitleForwardPrefetchRole(
+            isLive: isLive,
+            hasEmbeddedDrainTargets: !embeddedSubtitleDrainTargets.isEmpty,
+            hasSource: loadedURL != nil,
+            advanceReach: subtitleAdvanceReach,
+            ocrArmed: subtitleOCRArmedOrdinal != nil,
+            hasBitmapDrainTarget: hasEmbeddedBitmapDrainTarget)
+    }
+
+    /// AE#1015: how far ahead of the playhead a cue can be wanted: the host's declared advance
+    /// (AE#1031: its later offsets need only history, which reads nothing twice) and the negative
+    /// side of the software PiP delay. It sizes the bitmap decode lead too.
+    var subtitleAdvanceReach: Double {
+        max(maximumSubtitleAdvanceSeconds, -softwareSubtitleDelaySeconds)
+    }
+
+    /// AE#1015: re-decide the forward prefetch after the reach changed mid-session. Starts it at the
+    /// playhead when an advance appeared, stops it when the last one went away; a running session
+    /// that is still wanted is left alone.
+    /// AE#1022: a change of role (reach 0 against reach above 0 on a bitmap track) rebuilds it.
+    func syncSubtitleForwardPrefetchWithAdvanceReach() {
+        let wanted = wantedSubtitleForwardPrefetchRole
+        if let wanted,
+           subtitleForwardPrefetchTask == nil || subtitleForwardPrefetchActiveRole != wanted {
+            startSubtitleForwardPrefetcher()
+        } else if wanted == nil, subtitleForwardPrefetchTask != nil {
+            cancelSubtitleForwardPrefetcher(reason: .noAdvanceReach)
+        }
     }
 
     /// #151: a drain-tick jump with an existing cursor (seek / producer re-anchor) restarts the
@@ -803,6 +867,15 @@ extension AetherEngine {
     /// drainer keeps working off the pump's harvest exactly as before.
     func startSubtitleForwardPrefetcher(startAt: Double? = nil) {
         let anchor = max(0, startAt ?? sourceTime)
+        // AE#1015: a session nothing reads ahead of is stopped under its own name, so the log
+        // does not read as a rebuild that never came back. AE#1022: a bitmap track keeps it in
+        // its landing role.
+        guard let role = wantedSubtitleForwardPrefetchRole else {
+            cancelSubtitleForwardPrefetcher(reason: .noAdvanceReach)
+            return
+        }
+        let landingWindow = role == .landingWindow
+            ? Self.subtitleLandingWindow : Self.subtitleReadAheadWindow
         // Phase D: while the OCR worker is armed the prefetcher must out-run the worker's
         // 240 s window, or the packet store never holds what the worker wants to decode.
         // #362: otherwise it parks a margin BEYOND the drain window, so the set at the window's
@@ -814,18 +887,20 @@ extension AetherEngine {
         // (the loop captures it at start), and only a live task can be handed the request at all.
         if let reanchor = subtitleForwardPrefetchReanchor,
            subtitleForwardPrefetchTask != nil,
-           subtitleForwardPrefetchActiveLead == lead {
+           subtitleForwardPrefetchActiveLead == lead,
+           subtitleForwardPrefetchActiveRole == role {
+            // AE#1022: the seek already sent the session here.
+            if let requested = subtitlePrefetchLandingRequestedAt,
+               requested.seekGeneration == currentSeekGeneration,
+               abs(anchor - requested.seconds) < Self.subtitleDrainJumpThresholdSeconds { return }
+            subtitlePrefetchLandingRequestedAt = (anchor, currentSeekGeneration)
             // #250: the seek this move serves rides along, so the read position it banks after the
             // reposition is fenced to that seek rather than to the one the session started under.
             reanchor.request(anchor, seekGeneration: currentSeekGeneration)
             return
         }
         cancelSubtitleForwardPrefetcher(reason: .prefetchRebuild)
-        guard Self.shouldRunSubtitleForwardPrefetch(
-            isLive: isLive,
-            hasEmbeddedDrainTargets: !embeddedSubtitleDrainTargets.isEmpty,
-            hasSource: loadedURL != nil),
-            let store = activeSubtitlePacketStore,
+        guard let store = activeSubtitlePacketStore,
             let url = loadedURL else { return }
         let isCustom = isCustomSource
         if isCustom, customReader == nil { return }
@@ -836,6 +911,8 @@ extension AetherEngine {
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         let titleID = activeDiscTitleID
         subtitleForwardPrefetchActiveLead = lead
+        subtitleForwardPrefetchActiveRole = role
+        subtitlePrefetchLandingRequestedAt = (anchor, currentSeekGeneration)
         let link = SideReaderLinkArbiter(gate: sideReaderLinkGate)
         subtitleForwardPrefetchTask = BlockingWork.detached(priority: .utility) { [weak self] in
             // #231: the loop used to end on the first failed read and only a seek or producer
@@ -884,7 +961,8 @@ extension AetherEngine {
                     url: url, reader: attemptReader, formatHint: formatHint, headers: headers,
                     headerStore: headerStore, startAt: resumeAt, callerProbesize: probesize,
                     callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                    selectTitleID: titleID, store: store, leadSeconds: lead, link: link)
+                    selectTitleID: titleID, store: store, leadSeconds: lead,
+                    landingWindow: landingWindow, link: link)
                 guard outcome.exit.isRestartable, !Task.isCancelled else { return }
 
                 guard let backoff = budget.chargeFailure(harvested: outcome.harvested) else {
@@ -926,6 +1004,72 @@ extension AetherEngine {
         subtitleForwardPrefetchDemuxer = nil
         subtitleForwardPrefetchReanchor = nil
         subtitleForwardPrefetchActiveLead = nil
+        subtitleForwardPrefetchActiveRole = nil
+        subtitlePrefetchLandingRequestedAt = nil
+    }
+
+    /// AE#1022: a bitmap set still carrying its open placeholder end covers every position after
+    /// it, so from the moment the clock jumps it is drawn over the landing until the first reset
+    /// tick closes it (#357), and that tick comes only after the landed frame prerolled.
+    ///
+    /// Round 2: the end is set from the DEPARTURE, not the landing. A set open at the departure
+    /// has its clear still unread, and the harvest runs ahead of the playhead, so the set really
+    /// lasted at least to the departure and nothing beyond it is known. Closed at the landing
+    /// instead, it claimed the whole jumped-over stretch, and a later seek back into that stretch
+    /// drew it (retest: a set from 0 s drawn from 54 s to 58 s after a seek to 58 s and back).
+    /// A set that starts after the departure was never seen; if it starts before a forward landing
+    /// it is closed at its own start. That does not lose it: a re-decode of the same set replaces
+    /// it (`insertCueSorted`), and one that really is the landing line comes back through the
+    /// reconstruction. An open set after the landing is left alone, as is one ahead of a backward
+    /// landing, which is an ordinary not-yet-closed set.
+    ///
+    /// Round 3: from here to the landing no drain tick may publish (see
+    /// `subtitleDepartureClosedSeekGeneration`), or it puts the closed sets back.
+    func closeOpenEndedSubtitleCues(atSeekFrom departure: Double, to landing: Double) {
+        subtitleDepartureClosedSeekGeneration = currentSeekGeneration
+        guard landing.isFinite else { return }
+        for channel in [SubtitleChannel.primary, .secondary] {
+            var cues = retainedSubtitleCues(for: channel)
+            if Self.closeOpenEndedCues(&cues, seekFrom: departure, to: landing) {
+                publishRetainedSubtitleCues(cues, for: channel)
+            }
+        }
+    }
+
+    /// AE#1022 round 2: the per-cue rule of `closeOpenEndedSubtitleCues(atSeekFrom:to:)`. A
+    /// departure that is not finite (no frame yet) falls back to the landing, the round 1 rule.
+    nonisolated static func closeOpenEndedCues(_ cues: inout [SubtitleCue],
+                                               seekFrom departure: Double, to landing: Double) -> Bool {
+        let from = departure.isFinite ? departure : landing
+        var changed = false
+        for i in 0..<cues.count {
+            let cue = cues[i]
+            guard cue.endTime - cue.startTime > subtitleOpenEndedWindowSeconds else { continue }
+            let end: Double
+            if cue.startTime < from {
+                end = from
+            } else if cue.startTime < landing {
+                end = cue.startTime
+            } else {
+                continue
+            }
+            guard end < cue.endTime else { continue }
+            cues[i] = cue.with(endTime: end)
+            changed = true
+        }
+        return changed
+    }
+
+    /// AE#1022: send a running prefetch session to a seek's landing, on the source axis, as the
+    /// seek goes out. The first drain tick after a seek comes only once the landed frame has
+    /// prerolled (measured 0.67 s), and the ground behind the landing is then already read.
+    func requestSubtitlePrefetchLanding(at sourceSeconds: Double) {
+        guard subtitleForwardPrefetchTask != nil,
+              let reanchor = subtitleForwardPrefetchReanchor,
+              sourceSeconds.isFinite else { return }
+        let landing = max(0, sourceSeconds)
+        subtitlePrefetchLandingRequestedAt = (landing, currentSeekGeneration)
+        reanchor.request(landing, seekGeneration: currentSeekGeneration)
     }
 
     /// Open + position the prefetch side demuxer, then hand off to the packet loop. Mirrors
@@ -937,6 +1081,7 @@ extension AetherEngine {
         headerStore: RequestHeaderStore?,
         startAt: Double, callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?,
         selectTitleID: Int?, store: SubtitlePacketStore, leadSeconds: Double,
+        landingWindow: SubtitleForwardPrefetcher.LandingWindow,
         link: SideReaderLinkArbiter?
     ) async -> SubtitleForwardPrefetcher.Outcome {
         let demuxer = Demuxer()
@@ -1029,14 +1174,15 @@ extension AetherEngine {
         // destination stays dark. Lowest index matches what the score used to elect.
         let seekAnchor = streams.min() ?? -1
         let engineDisplayDuration = await MainActor.run { [weak self] in self?.duration ?? 0 }
+        let readFrom = landingWindow.readStart(for: startAt)
         let landed = SubtitleForwardPrefetcher.reposition(
-            demuxer: demuxer, to: startAt, anchorStreamIndex: seekAnchor,
+            demuxer: demuxer, to: readFrom, anchorStreamIndex: seekAnchor,
             fallbackDuration: engineDisplayDuration,
             timeout: Self.sideReaderSeekBudgetSeconds)
         // #416: this session reads forwards from here, and nothing below it is this reader's to
-        // claim. Stated even when the positioning fell back or failed: what the loop then reads is
-        // still forwards from wherever it sits, and the anchor is the earliest it can be.
-        store.noteHarvestAnchor(.prefetch, at: startAt)
+        // claim. #941: only when the seek completed. A failed one leaves the cursor wherever the
+        // open and the cue-index prewarm put it, which can be past `startAt`.
+        SubtitleForwardPrefetcher.noteRepositionCoverage(landed, at: readFrom, store: store)
         if landed != .seek, !Task.isCancelled {  // AE#944: a cancelled session's positioning is noise
             EngineLog.emit(
                 "[AetherEngine] #151 forward prefetch seek to \(String(format: "%.2f", startAt))s timed out "
@@ -1066,17 +1212,28 @@ extension AetherEngine {
         EngineLog.emit(
             "[AetherEngine] #151 forward prefetch started: streams=\(streams.sorted()) "
             + "pacing=\(pacing) anchor=\(seekAnchor) "
-            + "startAt=\(String(format: "%.2f", startAt))s lead=\(leadSeconds)s",
+            + "startAt=\(String(format: "%.2f", startAt))s lead=\(leadSeconds)s"
+            + " readFrom=\(String(format: "%.2f", readFrom))s"
+            + (landingWindow.aheadSeconds.map { " parksAt=landing+\($0)s" } ?? ""),
             category: .engine)
         let outcome = await SubtitleForwardPrefetcher.run(
             demuxer: demuxer, store: store,
             streamIndices: streams, assemblyIndices: assembly,
             pacingIndex: pacing,
             leadSeconds: leadSeconds,
-            parkPollNanoseconds: Self.subtitleForwardPrefetchParkPollNanoseconds,
+            // AE#1022: a landing session parks until the next seek, and the poll is what notices
+            // that seek. A refused landing line waits on it, so it is polled faster.
+            parkPollNanoseconds: landingWindow.aheadSeconds == nil
+                ? Self.subtitleForwardPrefetchParkPollNanoseconds
+                : Self.subtitleLandingWindowParkPollNanoseconds,
             link: link,
             reanchor: reanchor,
             fence: fence,
+            landingWindow: landingWindow,
+            landing: startAt,
+            landingWindowRead: { [weak self] in
+                await MainActor.run { [weak self] in self?.requestSubtitleDrainTick() }
+            },
             playhead: { [weak self] in
                 await MainActor.run(body: { [weak self] in self?.sourceTime })
             })
@@ -1117,15 +1274,32 @@ extension AetherEngine {
             }
         }
         // Audit FEA-101: the store bounds these, but an entry is a plain value and the conversion traps.
-        pkt.pointee.pts = SourceTimestampBounds.roundedTicks(entry.ptsSeconds * 1000) ?? Int64.min
+        let ticksPerSecond = Double(storedSubtitlePacketTicksPerSecond)
+        pkt.pointee.pts = SourceTimestampBounds.roundedTicks(entry.ptsSeconds * ticksPerSecond) ?? Int64.min
         pkt.pointee.dts = pkt.pointee.pts
-        pkt.pointee.duration = max(0, SourceTimestampBounds.roundedTicks(entry.durationSeconds * 1000) ?? 0)
+        pkt.pointee.duration = max(0, SourceTimestampBounds.roundedTicks(entry.durationSeconds * ticksPerSecond) ?? 0)
         pkt.pointee.flags = entry.flags
         // #233: WebVTT placement lives in side data, not in the payload, so it has to be put back.
         if let settings = entry.webvttSettings {
             WebVTTCueSettings.attach(settings: settings, to: pkt)
         }
-        return decoder.decode(packet: pkt, streamTimeBase: AVRational(num: 1, den: 1000))
+        return decoder.decode(packet: pkt, streamTimeBase: AVRational(num: 1, den: storedSubtitlePacketTicksPerSecond))
+    }
+
+    /// The time base a stored packet is rebuilt on, so a decoded cue start is its packet's PTS
+    /// rounded to this grid, up to half a tick away from the PTS the store holds.
+    nonisolated static let storedSubtitlePacketTicksPerSecond: Int32 = 1000
+
+    /// AE#1001: the stored packet that closes a cue starting at `cueStart`. The start went through
+    /// the reconstruction's rounding and the store did not, so a start rounded DOWN sits just below
+    /// the cue's own packet, and a strict "after" returned that packet as its own successor (6.976167
+    /// decoded as 6.976, closed at 6.976167, shown for 0.167 ms). Searching from one full tick past
+    /// the start steps over the cue's own packet whichever way it rounded; no authored successor is
+    /// that close.
+    nonisolated static func authoredSuccessorPTS(in store: SubtitlePacketStore, streamIndex: Int32,
+                                                 afterCueStart cueStart: Double) -> Double? {
+        store.firstPTS(streamIndex: streamIndex,
+                       after: cueStart + 1 / Double(storedSubtitlePacketTicksPerSecond))
     }
 
     /// #271: the channel's retained array, bound once per drain tick. Reading it here and writing it
@@ -1223,12 +1397,16 @@ extension AetherEngine {
         // whether it ever read that stretch before reading its silence as an answer.
         // Asked for bitmap events only: a text cue carries its own duration, so it claims nothing
         // about the ground behind it, and a dense text track would pay the lookup per packet.
-        let groundIsRead = event.isPGS
-            ? subtitleLandingGroundIsRead(cues: event.cues, playhead: sourceTime, channel: channel)
-            : true
-        // A false answer here means an actual refusal: the helper returns true when the event
-        // carries no cue behind the playhead, so there is nothing that could have been refused.
-        if !groundIsRead { applied.landingWithheld += 1 }
+        let unreadLandingStart = event.isPGS
+            ? subtitleLandingUnreadGroundStart(cues: event.cues, playhead: sourceTime, channel: channel)
+            : nil
+        let groundIsRead = unreadLandingStart == nil
+        // A refusal here is an actual one: the helper answers nil when the event carries no cue
+        // behind the playhead, so there is nothing that could have been refused.
+        if let unreadLandingStart {
+            applied.landingWithheld += 1
+            subtitleLandingAwaitingGround[channel] = unreadLandingStart   // AE#1022
+        }
         let admitted = pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
             .admit(cues: event.cues, isPGS: event.isPGS,
                    isSelfContained: event.isSelfContainedPGS, playhead: sourceTime,
@@ -1259,12 +1437,32 @@ extension AetherEngine {
     ///
     /// Coverage is a property of the SOURCE, not of a stream: a reader demuxes every stream it
     /// passes over, so a span one of them read is read for all of them.
-    private func subtitleLandingGroundIsRead(cues: [SubtitleCue], playhead: Double,
-                                             channel: SubtitleChannel) -> Bool {
-        guard let store = subtitlePacketStore(for: channel) else { return true }
+    ///
+    /// AE#1022: answers with that cue's start when the stretch was NOT read, nil otherwise, so the
+    /// drain can come back to the landing once it has been.
+    private func subtitleLandingUnreadGroundStart(cues: [SubtitleCue], playhead: Double,
+                                                  channel: SubtitleChannel) -> Double? {
+        guard let store = subtitlePacketStore(for: channel) else { return nil }
         guard let newestBehind = cues.lazy.map(\.startTime).filter({ $0 <= playhead }).max()
-        else { return true }
-        return store.hasReadSpan(from: newestBehind, through: playhead)
+        else { return nil }
+        return store.hasReadSpan(from: newestBehind, through: playhead) ? nil : newestBehind
+    }
+
+    /// AE#1022: what to do about a landing the ground check refused, on a later tick.
+    enum LandingGroundStep: Equatable {
+        case keepWaiting
+        case reconstruct
+        case abandon
+    }
+
+    /// AE#1022: reconstruct once the ground from the refused line to the playhead reads. Abandon
+    /// when the playhead has left the line behind by more than the drain's backscan (a
+    /// reconstruction would no longer reach back to it) or stands before it (a seek back).
+    nonisolated static func landingGroundStep(awaitingStart: Double, playhead: Double,
+                                              isRead: (Double, Double) -> Bool) -> LandingGroundStep {
+        guard playhead >= awaitingStart,
+              playhead - awaitingStart <= subtitleDrainBackscanSeconds else { return .abandon }
+        return isRead(awaitingStart, playhead) ? .reconstruct : .keepWaiting
     }
 
     /// #107: close every non-image cue (text or rich text) whose window covers `trimAt` (teletext
@@ -1570,6 +1768,7 @@ extension AetherEngine {
             clearSubtitleDrainTarget(channel: .primary, reason: .externalStoreBackfill)   // #112 rework
             activeEmbeddedSubtitleStreamIndex = -1
             loadedSidecarURL = track.url
+            loadedSidecarHeaders = nil
             sidecarASSHeader = nil
             isSubtitleActive = true
             activeSubtitleTrackIndex = id
@@ -1695,6 +1894,7 @@ extension AetherEngine {
         activeSubtitleTrackIndex = externalTrackID
 
         loadedSidecarURL = url
+        loadedSidecarHeaders = httpHeaders
         isSubtitleActive = true
         subtitleCues = []
         pgsStaleArrivalGates[.primary]?.reset()   // #100
@@ -1776,23 +1976,26 @@ extension AetherEngine {
 
     /// Both reload paths snapshot selection intent, including a candidate not yet published.
     /// This also survives a second rebuild before the first restore has finished decoding.
-    var secondarySelectionForRebuild: (externalID: Int?, sidecarURL: URL?, embeddedIndex: Int32) {
+    var secondarySelectionForRebuild: (externalID: Int?, sidecarURL: URL?, embeddedIndex: Int32,
+                                       sidecarHeaders: [String: String]?) {
         let external = pendingSecondaryExternalSubtitleTrackID ?? activeSecondaryExternalSubtitleTrackID
         let embedded: Int32 = external == nil ? activeSecondaryEmbeddedSubtitleStreamIndex : -1
         let url = external.flatMap { externalSubtitleRegistry[$0]?.url }
             ?? (isSecondarySubtitleActive && embedded < 0 ? loadedSecondarySidecarURL : nil)
-        return (external, url, embedded)
+        let oneShot = external == nil && url != nil
+        return (external, url, embedded, oneShot ? loadedSecondarySidecarHeaders : nil)
     }
 
     /// Audio rebuilds keep the registry. Restore through its id so headers and a container's
     /// selected subtitle stream survive; the URL-only route is only for one-shot sidecars.
     func restoreSecondarySubtitleAfterRebuild(externalID: Int?, sidecarURL: URL?,
+                                              sidecarHeaders: [String: String]? = nil,
                                               embeddedIndex: Int32, startAt: Double) {
         if let sidecarURL {
             if let externalID, externalSubtitleRegistry[externalID] != nil {
                 selectSecondarySubtitleTrack(index: externalID, startAt: startAt)
             } else {
-                selectSecondarySidecarSubtitle(url: sidecarURL)
+                selectSecondarySidecarSubtitle(url: sidecarURL, httpHeaders: sidecarHeaders)
             }
         } else if embeddedIndex >= 0 {
             selectSecondarySubtitleTrack(index: Int(embeddedIndex), startAt: startAt)
@@ -1810,6 +2013,7 @@ extension AetherEngine {
         // API has no identity to validate and keeps its historical replace-on-start behavior.
         if externalTrackID == nil {
             loadedSecondarySidecarURL = url
+            loadedSecondarySidecarHeaders = httpHeaders
             isSecondarySubtitleActive = true
             secondarySubtitleCues = []
             pgsStaleArrivalGates[.secondary]?.reset()   // #100
@@ -1827,6 +2031,7 @@ extension AetherEngine {
         let formatHint = selectedExternal?.formatHint
         let preserveASS = loadedOptions.preserveASSMarkup
         let sessionGeneration = loadGeneration
+        let sourceIsPQ = sourceIsPQForBitmapSubtitles
         #if DEBUG
         let decoderFactory = secondarySidecarDecoderFactoryForTesting
         #endif
@@ -1853,7 +2058,7 @@ extension AetherEngine {
                     #if DEBUG
                     if let decoderFactory { return PreparedSidecarDecoder(decoder: decoderFactory(source)) }
                     #endif
-                    return PreparedSidecarDecoder(decoder: source.makeDecoder())
+                    return PreparedSidecarDecoder(decoder: source.makeDecoder(sourceIsPQ: sourceIsPQ))
                 }.value
                 bitmapDecoder = prepared.decoder
             } else {
@@ -1878,6 +2083,7 @@ extension AetherEngine {
                 if let externalTrackID {
                     self.clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)
                     self.loadedSecondarySidecarURL = url
+                    self.loadedSecondarySidecarHeaders = httpHeaders
                     self.isSecondarySubtitleActive = true
                     self.pgsStaleArrivalGates[.secondary]?.reset()
                     self.setSecondarySubtitleIdentity(external: externalTrackID)
@@ -1940,6 +2146,7 @@ extension AetherEngine {
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
+        loadedSidecarHeaders = nil
         isSubtitleActive = false
         subtitleCues = []
         pgsStaleArrivalGates[.primary]?.reset()   // #100
@@ -1985,6 +2192,7 @@ extension AetherEngine {
         cancelSidecarTask(channel: .secondary)
         clearSubtitleDrainTarget(channel: .secondary, reason: .subtitlesCleared)   // #112 rework
         loadedSecondarySidecarURL = nil
+        loadedSecondarySidecarHeaders = nil
         isSecondarySubtitleActive = false
         secondarySubtitleCues = []
         secondarySidecarASSHeader = nil
@@ -2049,14 +2257,88 @@ extension AetherEngine {
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         let titleID = activeDiscTitleID
         let link = SideReaderLinkArbiter(gate: sideReaderLinkGate)
+        let isCustom = isCustomSource
         nativeSubtitleReadersTask = BlockingWork.detached(priority: .utility) { [weak self] in
-            await self?.runNativeSubtitleReaders(
-                url: url, reader: reader, formatHint: formatHint, headers: headers,
-                headerStore: headerStore, pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
-                callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                selectTitleID: titleID, readToEOF: readToEOF, link: link
-            )
+            // SUB-201: a read error used to look like EOF. Restart on one, bounded, with the same
+            // budget the #151 prefetcher uses (#231); only a real EOF finishes the stores.
+            var budget = SubtitleForwardPrefetcher.RestartBudget(
+                maxConsecutiveFailures: AetherEngine.subtitleForwardPrefetchMaxConsecutiveFailures,
+                maxRestarts: AetherEngine.subtitleForwardPrefetchMaxRestarts,
+                backoffNanoseconds: AetherEngine.subtitleForwardPrefetchRestartBackoffNanoseconds)
+            var resumeAt = startAt
+            var attemptReader = reader
+            while !Task.isCancelled {
+                guard let self else { return }
+                let outcome = await self.runNativeSubtitleReaders(
+                    url: url, reader: attemptReader, formatHint: formatHint, headers: headers,
+                    headerStore: headerStore, pairs: pairs, startAt: resumeAt, videoWidth: w, videoHeight: h,
+                    callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
+                    selectTitleID: titleID, readToEOF: readToEOF, link: link
+                )
+                switch Self.nativeReaderDisposition(
+                    outcome, readToEOF: readToEOF, budget: &budget, cancelled: Task.isCancelled) {
+                case .stop:
+                    return
+                case .markFinished:
+                    for pair in pairs { pair.store.markFinished() }
+                    return
+                case .giveUp:
+                    EngineLog.emit(
+                        "[AetherEngine] native subtitle readers giving up after \(budget.restarts) "
+                        + "restarts (\(budget.consecutiveFailures) consecutive)",
+                        category: .engine)
+                    if readToEOF { for pair in pairs { pair.store.markExternalFillFailed() } }
+                    return
+                case .restart(let backoff):
+                    do { try await Task.sleep(nanoseconds: backoff) } catch { return }
+                    guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime })
+                    else { return }
+                    resumeAt = readToEOF ? (outcome.resumeSeconds ?? resumeAt) : max(0, fresh)
+                    if isCustom {
+                        guard let clone = await MainActor.run(body: { [weak self] in
+                            self?.customReader?.makeIndependentReader()
+                        }) else { return }
+                        attemptReader = clone
+                    }
+                    EngineLog.emit(
+                        "[AetherEngine] native subtitle readers restarting after a read failure "
+                        + "(restart \(budget.restarts)) at \(String(format: "%.2f", resumeAt))s",
+                        category: .engine)
+                }
+            }
         }
+    }
+
+    /// What the supervisor does after one native reader session.
+    enum NativeReaderDisposition: Equatable {
+        case stop
+        case markFinished
+        case giveUp
+        case restart(backoffNanoseconds: UInt64)
+    }
+
+    /// Only a clean EOF of a whole-program read may mark the stores finished (Sodalite#32). A read
+    /// error restarts within the budget and then gives up without finishing, so a truncated store is
+    /// never served as complete (SUB-201).
+    nonisolated static func nativeReaderDisposition(
+        _ outcome: NativeSubtitleReaderOutcome, readToEOF: Bool,
+        budget: inout SubtitleForwardPrefetcher.RestartBudget, cancelled: Bool
+    ) -> NativeReaderDisposition {
+        guard !cancelled else { return .stop }
+        switch outcome.exit {
+        case .endOfFile: return readToEOF ? .markFinished : .stop
+        case .cancelled, .openFailed: return .stop
+        case .readFailed:
+            guard let backoff = budget.chargeFailure(harvested: outcome.cues) else { return .giveUp }
+            return .restart(backoffNanoseconds: backoff)
+        }
+    }
+
+    struct NativeSubtitleReaderOutcome {
+        let exit: SubtitleForwardPrefetcher.Exit
+        let cues: Int
+        /// Source seconds of the last packet read, where a whole-program restart picks up.
+        let resumeSeconds: Double?
     }
 
     /// #93 residual: start the lazy readers only when no producer restart is executing. PiP entry
@@ -2107,7 +2389,7 @@ extension AetherEngine {
     }
 
     /// Multi-stream side-demuxer pass: one EmbeddedSubtitleDecoder per text stream, writing to NativeSubtitleCueStores (not subtitleCues). Prewarm, re-sample, -2 s lead-in, park (the pacing the old inline reader used). Always plain text: mov_text muxer carries no ASS markup.
-    nonisolated private func runNativeSubtitleReaders(
+    nonisolated func runNativeSubtitleReaders(
         url: URL, reader: IOReader?, formatHint: String?,
         headers: [String: String],
         headerStore: RequestHeaderStore?,
@@ -2116,7 +2398,7 @@ extension AetherEngine {
         callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
         selectTitleID: Int? = nil, readToEOF: Bool = false,
         link: SideReaderLinkArbiter? = nil
-    ) async {
+    ) async -> NativeSubtitleReaderOutcome {
         let demuxer = Demuxer()
         let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
             callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration).withReaderLabel("nativesubs")
@@ -2128,7 +2410,7 @@ extension AetherEngine {
         }
         guard registered else {
             reader?.close()
-            return
+            return NativeSubtitleReaderOutcome(exit: .cancelled, cues: 0, resumeSeconds: nil)
         }
         defer {
             Task { @MainActor [weak self, weak demuxer] in
@@ -2146,7 +2428,7 @@ extension AetherEngine {
         } catch {
             EngineLog.emit("[AetherEngine] native subtitle readers open failed: \(error)", category: .engine)
             reader?.close()
-            return
+            return NativeSubtitleReaderOutcome(exit: .openFailed, cues: 0, resumeSeconds: nil)
         }
         defer {
             demuxer.close()
@@ -2210,7 +2492,9 @@ extension AetherEngine {
             if EmbeddedSubtitleDecoder.isBitmapCodec(decoder.codecID) { continue }
             routes[pair.streamIndex] = (decoder, pair.store, stream.pointee.time_base)
         }
-        guard !routes.isEmpty else { return }
+        guard !routes.isEmpty else {
+            return NativeSubtitleReaderOutcome(exit: .openFailed, cues: 0, resumeSeconds: nil)
+        }
 
         // #104: discard video/audio (and any non-routed subtitle stream) on this side demuxer. Without it the
         // reader pulls and allocs EVERY video+audio sample byte-for-byte through a second AVIOReader just to
@@ -2245,35 +2529,45 @@ extension AetherEngine {
         var parkLogged = false
         var timeBaseCache: [Int32: AVRational] = [:]
         var totalCues = 0
+        var exit = SubtitleForwardPrefetcher.Exit.cancelled
+        var lastPosition: Double?
 
         readLoop: while !Task.isCancelled {
             // #240: the video path owns the link; this reader is lookahead. Same rule as the #151
             // prefetcher, same reason (on Matroska this reader pulls every video and audio byte to
             // reach the sparse subtitle packets). A whole-program pass has no lead to spend and is
             // not gated: `readToEOF` serves a .vtt request that is already waiting on it.
-            if let link, !readToEOF, valveGrantedUntil.map({ DispatchTime.now() > $0 }) ?? true {
-                var yielded: Double = 0
-                while !Task.isCancelled,
-                      link.shouldYield(inAnchorGrace: DispatchTime.now() < anchorGraceUntil,
-                                       yieldedSeconds: yielded) {
-                    guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime })
-                    else { break readLoop }
-                    playheadSnapshot = fresh
-                    do { try await Task.sleep(nanoseconds: link.pollNanoseconds) } catch { break readLoop }
-                    yielded += link.pollSeconds
-                }
-                if yielded >= link.maxYieldSeconds {
-                    valveGrantedUntil = DispatchTime.now() + link.valveGrantSeconds
+            if let link, !readToEOF {
+                guard let waited = await SideReaderLoop.yieldLink(
+                    link, valveGrantedUntil: &valveGrantedUntil,
+                    inAnchorGrace: { DispatchTime.now() < anchorGraceUntil },
+                    playhead: { await MainActor.run { [weak self] in self?.sourceTime } })
+                else { break readLoop }
+                if let fresh = waited.playhead { playheadSnapshot = fresh }
+                if waited.tookValve {
                     // Same line the #151 prefetcher emits, because a grant that is not logged
                     // reads from the outside like a reader taking the link without permission.
                     EngineLog.emit(
                         "[AetherEngine] native subtitle readers yielded the link for "
-                        + "\(Int(yielded))s; taking \(Int(link.valveGrantSeconds))s of it back "
+                        + "\(Int(waited.seconds))s; taking \(Int(link.valveGrantSeconds))s of it back "
                         + "(the video path is not releasing it)",
                         category: .engine)
                 }
             }
-            guard let pkt = try? demuxer.readPacket() else { break }
+            let pkt: UnsafeMutablePointer<AVPacket>
+            switch SideReaderLoop.readNext(demuxer) {
+            case .failed(let error):
+                EngineLog.emit(
+                    "[AetherEngine] native subtitle readers read failed after \(totalCues) cues: \(error)",
+                    category: .engine)
+                exit = .readFailed
+                break readLoop
+            case .endOfFile:
+                exit = .endOfFile
+                break readLoop
+            case .packet(let next):
+                pkt = next
+            }
             let streamIdx = pkt.pointee.stream_index
 
             // #230: a pacing packet is placed by DTS, the read position the park bounds; a routed
@@ -2287,6 +2581,7 @@ extension AetherEngine {
                     pts: pkt.pointee.pts, dts: pkt.pointee.dts,
                     timeBase: ptb, preferDecodeOrder: routes[streamIdx] == nil)
             }
+            if let pktSeconds { lastPosition = pktSeconds }
 
             if let route = routes[streamIdx] {
                 let event = route.decoder.decode(packet: pkt, streamTimeBase: route.tb)
@@ -2335,16 +2630,13 @@ extension AetherEngine {
             }
         }
 
-        // Sodalite#32: reaching here without cancellation means the side demuxer hit EOF, so every cue for the
-        // whole program is now in the stores; signal completeness for the whole-program .vtt handler.
-        if readToEOF && !Task.isCancelled {
-            for pair in pairs { pair.store.markFinished() }
-        }
-
         EngineLog.emit(
-            "[AetherEngine] native subtitle readers exited (cancelled=\(Task.isCancelled)) totalCues=\(totalCues) readToEOF=\(readToEOF)",
+            "[AetherEngine] native subtitle readers exited (cancelled=\(Task.isCancelled)) exit=\(exit) "
+            + "totalCues=\(totalCues) readToEOF=\(readToEOF)",
             category: .engine
         )
+        return NativeSubtitleReaderOutcome(exit: Task.isCancelled ? .cancelled : exit,
+                                           cues: totalCues, resumeSeconds: lastPosition)
     }
 
     /// #93 PiP skips: debounced re-anchor after a far rendered-time jump. Waits for the skip
@@ -2354,6 +2646,7 @@ extension AetherEngine {
     /// whole-program eager reader is left alone: it converges on full coverage by itself.
     func scheduleNativeSubtitleReanchor() {
         guard nativeSubtitleReapplyOrdinal != nil,
+              !nativeSubtitleSelectionIsMarker,   // AE#1052: a marker has no coverage to keep
               !nativeSubtitleReadersRunToEOF,
               nativeVideoSession != nil else { return }
         nativeSubtitleReanchorTask?.cancel()
@@ -2379,26 +2672,65 @@ extension AetherEngine {
                 + "readMax=\(String(format: "%.2f", readMax))); replaying selection ordinal=\(ordinal)",
                 category: .engine
             )
+            guard !self.nativeSubtitleSelectionIsMarker else { return }
             self.cancelNativeSubtitleReaders()
-            self.setNativeSubtitleSelected(track: ordinal)
+            self.applyNativeSubtitleSelection(track: ordinal)
         }
     }
 
 
     /// Select or deselect the native mov_text track by ordinal (#55). nil deselects all. Matches by `extendedLanguageTag` first (language-rank-aware for same-language duplicates), falls back to positional index. No-op when no legible group or ordinal out of range.
-    public func setNativeSubtitleSelected(track ordinal: Int?) {
+    ///
+    /// AE#1052: `markerOnly: true` selects the rendition as a marker for AVKit's subtitle menu and
+    /// nothing else. The menu shows the track as selected and offers Off, the Sodalite#65 pin stands
+    /// down, no reader or OCR worker fills the rendition, and AVKit's text is styled invisible, so a
+    /// host drawing the track in its own overlay (bitmap cues keep their position that way) gets no
+    /// second copy. The marker stands until the host's next call here. While the picture is off the
+    /// app (`setNativeSubtitleRendering(true)`) the rendition is the display and fills as usual;
+    /// `setNativeSubtitleRendering(false)` returns to the marker instead of deselecting.
+    public func setNativeSubtitleSelected(track ordinal: Int?, markerOnly: Bool = false) {
+        nativeSubtitleMarkerOrdinal = markerOnly ? ordinal : nil
+        applyNativeSubtitleSelection(track: ordinal)
+    }
+
+    /// AE#1052: whether the standing selection is a menu marker rather than a rendition AVKit draws.
+    /// A marker only holds while the picture is in the app; off it, the rendition is the display.
+    nonisolated static func nativeSelectionIsMarker(
+        markerOrdinal: Int?, reapplyOrdinal: Int?, renderingRequested: Bool
+    ) -> Bool {
+        guard let markerOrdinal, !renderingRequested else { return false }
+        return reapplyOrdinal == markerOrdinal
+    }
+
+    var nativeSubtitleSelectionIsMarker: Bool {
+        Self.nativeSelectionIsMarker(markerOrdinal: nativeSubtitleMarkerOrdinal,
+                                     reapplyOrdinal: nativeSubtitleReapplyOrdinal,
+                                     renderingRequested: nativeSubtitleRenderingRequested)
+    }
+
+    /// The selection itself, shared by the host's call and the engine's own replays (#65 recovery,
+    /// #93 re-anchor, #170 reloads, rendering requests), which must not touch the host's marker.
+    func applyNativeSubtitleSelection(track ordinal: Int?) {
         // Remembered before any guard: the #93 recovery reload replays the host's last request
         // onto the fresh item even when this call raced a not-yet-current player.
         nativeSubtitleReapplyOrdinal = ordinal
-        syncSubtitleOCRWithNativeSelection(ordinal: ordinal)
+        nativeSubtitleSelectGeneration &+= 1
+        let generation = nativeSubtitleSelectGeneration
+        let marker = nativeSubtitleSelectionIsMarker
+        // AE#1052: a marker is never filled, so it arms nothing, and it disarms an OCR worker a
+        // PiP round trip left running.
+        syncSubtitleOCRWithNativeSelection(ordinal: marker ? nil : ordinal)
         // #15: lazy readers, run the side-demuxer only while a native track is selected (PiP), idle otherwise.
         // Sodalite#32: an eager read-to-EOF reader survives deselect (it is building whole-session coverage;
         // cancelling it on PiP exit left the store frozen at ~48s and every later .vtt served empty).
-        if ordinal != nil {
+        if ordinal != nil, !marker {
             startLazyNativeSubtitleReadersWhenIdle()
         } else if !nativeSubtitleReadersRunToEOF {
             cancelNativeSubtitleReaders()
         }
+        // AE#1052: set before the select, so the first fetch of a marker is already empty and the
+        // first fetch after it (PiP entry) already has cues.
+        silenceNativeRendition(ordinal: marker ? ordinal : nil)
         guard let item = currentAVPlayer?.currentItem else { return }
         // Capture track list; avoid capturing self to keep MainActor re-entrancy to one hop.
         let tracks = nativeSubtitleTracks
@@ -2409,6 +2741,7 @@ extension AetherEngine {
             currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
             guard !group.options.isEmpty else { return }
+            guard generation == nativeSubtitleSelectGeneration else { return }
             guard let ordinal else {
                 item.select(nil, in: group)
                 return
@@ -2441,6 +2774,22 @@ extension AetherEngine {
             // left ~45/46 segments empty (device-confirmed). Pre-fill far enough ahead to cover that burst; break
             // early when the reader stops making progress (EOF / read-ahead parked) so we never wait the full
             // deadline for content with little remaining.
+            if marker {
+                // AE#1052: nothing to wait for and nothing to refuse. The deselect-reselect makes AVKit
+                // fetch the segment under the playhead again, now empty, and drop the text an earlier
+                // PiP fill left on screen (device: it refetched the current segment on every reselect).
+                // Styling the text away does not do it: the transparent rule still left a dark box.
+                if item.currentMediaSelection.selectedMediaOption(in: group) != nil {
+                    item.select(nil, in: group)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    guard generation == nativeSubtitleSelectGeneration else { return }
+                }
+                item.select(option, in: group)
+                let after = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
+                EngineLog.emit("[AetherEngine] AE#1052 native subtitle marker: ordinal=\(ordinal) "
+                               + "selected=\(after), served empty", category: .engine)
+                return
+            }
             var prefilledCues: Int?
             if ordinal < nativeSubtitleTrackTable.count, nativeSubtitleTrackTable[ordinal].needsOCR,
                let store = nativeStore(atOrdinal: ordinal) {
@@ -2448,7 +2797,8 @@ extension AetherEngine {
                 // just armed. Its window is known exactly, so wait for that rather than for cue ends:
                 // a forced track's cues are sparse and would never reach the heuristic's target.
                 let began = Date()
-                let exit = await awaitSubtitleOCRCoverage(ordinal: ordinal, store: store, item: item)
+                let exit = await awaitSubtitleOCRCoverage(ordinal: ordinal, store: store, item: item,
+                                                          generation: generation)
                 let waited = Int(Date().timeIntervalSince(began) * 1000)
                 EngineLog.emit("[AetherEngine] native subtitle OCR pre-fill done: ordinal=\(ordinal) "
                                + "cues=\(store.cueCount) exit=\(exit) waited=\(waited)ms", category: .engine)
@@ -2502,6 +2852,8 @@ extension AetherEngine {
             // Refusing costs nothing that selecting would have bought: nothing is drawn either way,
             // and only the refusal can be retried. `nativeSubtitleReapplyOrdinal` is set before this
             // runs, so the readers' own re-anchor re-selects once coverage reaches the playhead.
+            // AE#1052: the pre-fill can take seconds; a marker or another pick may have replaced this one.
+            guard generation == nativeSubtitleSelectGeneration else { return }
             if prefilledCues == 0 {
                 EngineLog.emit("[AetherEngine] native subtitle select refused: rendition ordinal=\(ordinal) "
                                + "is empty at the playhead, and AVKit caches what it is handed. "
@@ -2591,7 +2943,9 @@ extension AetherEngine {
                                      externalID: track.isExternal ? track.id : nil,
                                      language: track.language,
                                      isForced: track.isForced,
-                                     needsOCR: true)
+                                     needsOCR: true,
+                                     title: track.sourceTitle,
+                                     isHearingImpaired: track.isHearingImpaired)
         }
     }
 
@@ -2600,20 +2954,54 @@ extension AetherEngine {
     /// legible option (device: three declared, groupOpts=2, and the second German track ended up
     /// selecting the English option through the old positional fallback). Same-language duplicates
     /// get a numbered suffix; the forced disposition is carried for FORCED=YES.
+    /// AE#1050: a track with its own title is named after it, so an SDH and a CC track in one
+    /// language read "English (SDH)" and "English (CC)" instead of "English" and "English 2".
     nonisolated static func nativeSubtitleRenditionInfos(
         for entries: [NativeSubtitleTrackEntry]
     ) -> [NativeSubtitleRenditionInfo] {
         var counts: [String: Int] = [:]
         return entries.enumerated().map { i, entry in
-            let base = entry.language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
+            let base = nativeSubtitleRenditionBaseName(language: entry.language, title: entry.title,
+                                                       isHearingImpaired: entry.isHearingImpaired)
                 ?? "Subtitle \(i + 1)"
             let n = (counts[base] ?? 0) + 1
             counts[base] = n
             return NativeSubtitleRenditionInfo(
                 language: entry.language,
                 name: n == 1 ? base : "\(base) \(n)",
-                isForced: entry.isForced
+                isForced: entry.isForced,
+                isHearingImpaired: entry.isHearingImpaired
             )
+        }
+    }
+
+    /// The language name, the track title, or both. A title that already names the language
+    /// ("English SDH") stands alone; one that does not ("SDH") goes in brackets after it. A title
+    /// that is only the language code ("eng") adds nothing and is dropped.
+    ///
+    /// An SDH track drops "SDH" from its title: it carries CHARACTERISTICS, and AVFoundation then
+    /// appends "SDH" to the name by itself. Measured on tvOS 26: NAME="English (SDH)" read
+    /// "English (SDH) SDH" in AVKit's menu.
+    nonisolated static func nativeSubtitleRenditionBaseName(language: String?, title: String?,
+                                                            isHearingImpaired: Bool = false) -> String? {
+        let languageName = language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
+        var cleanTitle = title?
+            // NAME is a quoted-string in the master; a quote or a line break would end the tag.
+            .replacingOccurrences(of: "\"", with: "'")
+            .components(separatedBy: .newlines).joined(separator: " ")
+        if isHearingImpaired, let t = cleanTitle {
+            cleanTitle = t.replacingOccurrences(of: #"\bSDH\b"#, with: "", options: [.regularExpression, .caseInsensitive])
+                .replacingOccurrences(of: #"\(\s*\)|\[\s*\]"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+        }
+        cleanTitle = cleanTitle?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.init(charactersIn: "-,/|")))
+        if let t = cleanTitle, t.isEmpty || (language.map { languageMatches(t, $0) } ?? false) { cleanTitle = nil }
+        switch (languageName, cleanTitle) {
+        case let (name?, title?):
+            return title.localizedCaseInsensitiveContains(name) ? title : "\(name) (\(title))"
+        case let (name?, nil): return name
+        case let (nil, title?): return title
+        case (nil, nil): return nil
         }
     }
 
@@ -2655,13 +3043,18 @@ extension AetherEngine {
             pendingNativeRenderingRequest = active
             return
         }
-        guard active, let activeIdx = activeSubtitleTrackIndex,
-              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable)
-        else {
-            setNativeSubtitleSelected(track: nil)
+        // AE#1052: back in the app, a host's menu marker stands again instead of a deselect.
+        guard active else {
+            applyNativeSubtitleSelection(track: nativeSubtitleMarkerOrdinal)
             return
         }
-        setNativeSubtitleSelected(track: ordinal)
+        guard let activeIdx = activeSubtitleTrackIndex,
+              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable)
+        else {
+            applyNativeSubtitleSelection(track: nil)
+            return
+        }
+        applyNativeSubtitleSelection(track: ordinal)
     }
 
     // MARK: - Session-preserving reload carryover (#170)
@@ -2688,12 +3081,15 @@ extension AetherEngine {
         carryover.activeSubtitleTrackIndex = activeSubtitleTrackIndex
         carryover.primarySidecarURL = (isSubtitleActive && activeSubtitleTrackIndex == nil
             && activeEmbeddedSubtitleStreamIndex < 0) ? loadedSidecarURL : nil
+        carryover.primarySidecarHeaders = carryover.primarySidecarURL == nil ? nil : loadedSidecarHeaders
         let secondary = secondarySelectionForRebuild
         carryover.secondaryTrackIndex = secondary.externalID
             ?? (secondary.embeddedIndex >= 0 ? Int(secondary.embeddedIndex) : nil)
         carryover.secondarySidecarURL = carryover.secondaryTrackIndex == nil ? secondary.sidecarURL : nil
+        carryover.secondarySidecarHeaders = carryover.secondarySidecarURL == nil ? nil : secondary.sidecarHeaders
         carryover.nativeReapplyOrdinal = nativeSubtitleReapplyOrdinal
         carryover.reapplyOrdinalMatchesActiveTrack = currentReapplyOrdinalMatchesActiveTrack()
+        carryover.nativeMarkerOrdinal = nativeSubtitleMarkerOrdinal
         return carryover
     }
 
@@ -2734,7 +3130,7 @@ extension AetherEngine {
         case .reselect(let index):
             selectSubtitleTrack(index: index, startAt: startAt)
         case .sidecar(let url):
-            startSidecarDecode(url: url, httpHeaders: nil, externalTrackID: nil)
+            startSidecarDecode(url: url, httpHeaders: carryover.primarySidecarHeaders, externalTrackID: nil)
         case .clear:
             clearSubtitle()
         case .none:
@@ -2743,8 +3139,9 @@ extension AetherEngine {
         if let secondary = carryover.secondaryTrackIndex {
             selectSecondarySubtitleTrack(index: secondary, startAt: startAt)
         } else if let url = carryover.secondarySidecarURL {
-            selectSecondarySidecarSubtitle(url: url)
+            selectSecondarySidecarSubtitle(url: url, httpHeaders: carryover.secondarySidecarHeaders)
         }
+        nativeSubtitleMarkerOrdinal = carryover.nativeMarkerOrdinal
         if let pending = pendingNativeRenderingRequest {
             pendingNativeRenderingRequest = nil
             setNativeSubtitleRendering(pending)
@@ -2759,7 +3156,7 @@ extension AetherEngine {
                 "[AetherEngine] #170 re-applying native subtitle ordinal=\(ordinal) after session-preserving reload",
                 category: .engine
             )
-            setNativeSubtitleSelected(track: ordinal)
+            applyNativeSubtitleSelection(track: ordinal)
         }
     }
 
@@ -2872,6 +3269,14 @@ extension AetherEngine {
         nativeLegibleDeselectPinBurst.reset()
     }
 
+    // MARK: - Menu marker (AE#1052)
+
+    /// Only the marker's store answers empty; every other rendition serves as usual.
+    func silenceNativeRendition(ordinal: Int?) {
+        guard let stores = nativeVideoSession?.nativeSubtitleCueStoresForSession else { return }
+        for (index, store) in stores.enumerated() { store.servesSilently = index == ordinal }
+    }
+
     // MARK: - Remote-HLS bypass legible selection (AE#154)
 
     /// Surface the bypass item's legible AVMediaSelectionGroup as `subtitleTracks` (synthetic ids,
@@ -2959,6 +3364,7 @@ extension AetherEngine {
         // AVPlayer owns the drawing here; leaving overlay cues behind would double up.
         subtitleCues = []
         loadedSidecarURL = nil
+        loadedSidecarHeaders = nil
         isSubtitleActive = true
         activeSubtitleTrackIndex = id
         isLoadingSubtitles = false
@@ -3024,13 +3430,14 @@ struct SubtitleDrainChannelWork {
     let entries: [StoredSubtitlePacket]
     let batchEnd: Int
     let decodeEnd: Int
-    let gapHoldAt: Double?
-    let gapHoldSequence: UInt64
-    let gapHoldTicksLeft: Int
+    let gapHold: SubtitleOverlayDrainer.HarvestGapHold?
 }
 
 struct SubtitleDrainTickWork {
     let playhead: Double
+    /// AE#1022 round 3: the seek generation the tick was planned under. A seek in between moved
+    /// the playhead and closed the open sets the batch is about to publish again.
+    var seekGeneration: UInt64 = 0
     var channels: [SubtitleDrainChannelWork] = []
     var prefetchNeedsReanchor = false
 

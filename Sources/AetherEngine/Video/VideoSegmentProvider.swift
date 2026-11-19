@@ -6,10 +6,20 @@ import Foundation
 /// (HLS requirement; duplicates make AVFoundation collapse same-language renditions into one
 /// legible option), FORCED carries the container disposition into EXT-X-MEDIA. Built once at load
 /// by `AetherEngine.nativeSubtitleRenditionInfos(for:)`.
+/// AE#1049: one source audio track as the master's audio group lists it. Only the served track is
+/// in the variant; the rest are URI-less entries a viewer can pick from AVKit's audio menu.
+struct AudioRenditionChoice: Sendable, Equatable {
+    let trackID: Int
+    let language: String?
+    let name: String
+    let channels: Int
+}
+
 struct NativeSubtitleRenditionInfo: Sendable, Equatable {
     let language: String?
     let name: String
     let isForced: Bool
+    var isHearingImpaired: Bool = false
 }
 
 // MARK: - Live window sizing
@@ -831,6 +841,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#458: ISO 639-2/T of the ONE audio track muxed into the variant, for the master's
     /// EXT-X-MEDIA:TYPE=AUDIO tag. Nil for a source whose audio carries no resolvable language.
     private let audioLanguage: String?
+    /// AE#1049: every source audio track, uniquely named once for the whole session, and the one
+    /// served in the variant. Empty unless the host opted in with `LoadOptions.nativeAudioTrackMenu`.
+    private let audioMenuChoices: [AudioRenditionChoice]
+    private let servedAudioTrackID: Int
     /// Channel count of the audio track as it is SERVED (the muxer's codecpar, so a bridged track
     /// reports the encoder's layout, not the source's). Drives CHANNELS on the audio rendition.
     private let audioChannelCount: Int?
@@ -961,6 +975,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Set by cancelWaiters() on stop(). Without it, parked LL-HLS blocking-reload threads sleep
     /// their full timeout (18-30 s) and can write stale playlists into a recycled fd of the next session.
     private var waitersCancelled = false
+    /// Audit HLS-203: the halt's own release. Separate from `waitersCancelled` (permanent, stop()) so
+    /// a host-authorized retry can clear it and let blocking reloads hold again.
+    private var waitersHaltedForRetune = false
     /// Terminal latch (#167 follow-up): the live pump exited for host retune (SSAI cutter wedge,
     /// source replay, custom-reader death), so no further segment will ever be cut into this provider.
     /// The cadence policy cannot see this (it observes ingest arrivals, which keep flowing while the
@@ -1115,6 +1132,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         audioLanguage: String? = nil,
         audioChannelCount: Int? = nil,
         audioIsAtmosStreamCopy: Bool = false,
+        audioMenuChoices: [AudioRenditionChoice] = [],
+        servedAudioTrackID: Int = -1,
         videoLayout: String? = nil,
         isLive: Bool = false,
         servesSegmentsProgressively: Bool = false,
@@ -1181,6 +1200,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.sourcePeakBitrate = sourcePeakBitrate
         self.bridgedAudioPeakBitrate = bridgedAudioPeakBitrate
         self.audioLanguage = audioLanguage
+        self.audioMenuChoices = audioMenuChoices
+        self.servedAudioTrackID = servedAudioTrackID
         self.audioChannelCount = audioChannelCount
         self.audioIsAtmosStreamCopy = audioIsAtmosStreamCopy
         self.videoLayout = videoLayout
@@ -1696,7 +1717,26 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     func mediaSegmentURL(at index: Int) -> URL? {
         guard index >= 0, index < currentSegmentCount else { return nil }
         handleTargetChange(to: index)
-        return cache.peekURL(index: index)
+        guard let url = cache.peekURL(index: index) else {
+            // The server asks `mediaSegmentSource` next; its serve path must not declare the same
+            // request again (audit slice 11: double count, handleTargetChange twice).
+            stateLock.lock()
+            targetDeclaredByURLPath = index
+            stateLock.unlock()
+            return nil
+        }
+        return url
+    }
+
+    /// Set by `mediaSegmentURL` on a miss, taken by the serve path that follows it.
+    private var targetDeclaredByURLPath: Int?
+
+    private func takeTargetDeclaredByURLPath(_ index: Int) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard targetDeclaredByURLPath == index else { return false }
+        targetDeclaredByURLPath = nil
+        return true
     }
 
     /// Total media-segment requests seen (both serve paths). The #65 consumer re-engage watchdog
@@ -1927,27 +1967,37 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     private var fetchesProgressively: Bool { !isLive && servesSegmentsProgressively }
 
+    /// Live only: the index can never be served again. Below the first visible entry, or not
+    /// resident although a later segment is already stored (live stores in order, so a newer
+    /// stored index proves this one was produced and then dropped). Only an index above the
+    /// stored front can still arrive.
+    func liveSegmentIsGone(_ index: Int) -> Bool {
+        guard isLive else { return false }
+        stateLock.lock()
+        let firstVisible = _liveFirstVisible
+        stateLock.unlock()
+        if index < firstVisible { return true }
+        return index < cache.highestStoredIndex && cache.peekURL(index: index) == nil
+    }
+
     private func serveSource(at index: Int) -> SegmentSource? {
         guard index >= 0, index < currentSegmentCount else { return nil }
+        let alreadyDeclared = takeTargetDeclaredByURLPath(index)
 
-        // Segment below the live window is evicted; returning nil = fast 404 so AVPlayer resyncs.
-        // Without this, the 30 s cache.fetch parks the connection for a segment that will never reappear.
-        if isLive {
-            stateLock.lock()
-            let firstVisible = _liveFirstVisible
-            stateLock.unlock()
-            if index < firstVisible {
-                EngineLog.emit(
-                    "[HLSVideoEngine] seg\(index): below live window (firstVisible=\(firstVisible)), fast 404",
-                    category: .session
-                )
-                return nil
-            }
+        // A live segment that is gone (below the window, or evicted while its playlist entry is still
+        // listed) will never be produced again; answering nil at once makes the server 404 it so
+        // AVPlayer resyncs, instead of the 30 s cache.fetch park and a retriable 503 (audit HLS-204).
+        if liveSegmentIsGone(index) {
+            EngineLog.emit(
+                "[HLSVideoEngine] seg\(index): gone from the live window, fast 404",
+                category: .session
+            )
+            return nil
         }
 
         let totalStart = DispatchTime.now()
 
-        handleTargetChange(to: index)
+        if !alreadyDeclared { handleTargetChange(to: index) }
 
         // Fast path: serve from cache.
         if let hit = cache.peek(index: index) {
@@ -2944,7 +2994,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.lock()
         _liveProductionHalted = true
         stateLock.unlock()
-        cancelWaiters()
+        firstSegmentCondition.lock()
+        waitersHaltedForRetune = true
+        firstSegmentCondition.broadcast()
+        firstSegmentCondition.unlock()
     }
 
     /// A host-authorized source retry continues this same cache and playlist.
@@ -2952,6 +3005,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.lock()
         _liveProductionHalted = false
         stateLock.unlock()
+        firstSegmentCondition.lock()
+        waitersHaltedForRetune = false
+        firstSegmentCondition.unlock()
     }
     var liveTargetDurationFloorSeconds: Double? {
         // The floor tracks observed cadence regardless of the gate override: patience must cover the real
@@ -3121,7 +3177,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         parkedWaiters += 1
         defer { parkedWaiters -= 1 }
         while true {
-            if waitersCancelled { return false }
+            if waitersCancelled || waitersHaltedForRetune { return false }
             if !didLogStartupPolicy {
                 didLogStartupPolicy = true
                 let grace = startupGraceSeconds.map(LiveEdgePolicy.seconds) ?? "auto"
@@ -3352,7 +3408,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         parkedWaiters += 1
         defer { parkedWaiters -= 1 }
         while true {
-            if waitersCancelled { return false }
+            if waitersCancelled || waitersHaltedForRetune { return false }
             stateLock.lock()
             let count = segments.count
             stateLock.unlock()
@@ -3445,6 +3501,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#726: an untagged track gets no rendition, except a stream-copied E-AC-3 JOC one. Its CHANNELS is
     /// the only place the master can say "object audio", and without the tag AVFoundation renders the bed.
     var masterAudioRendition: (language: String?, name: String)? {
+        // AE#1049: with the menu on, the served track keeps the name it had as an alternate, so
+        // a switch does not rename the entries under the viewer (measured: "English" read
+        // "English 2" after a switch onto the other English track).
+        if let rendition = languageOrAtmosRendition,
+           let served = audioMenuChoices.first(where: { $0.trackID == servedAudioTrackID }) {
+            return (language: rendition.language, name: served.name)
+        }
+        return languageOrAtmosRendition
+    }
+
+    private var languageOrAtmosRendition: (language: String?, name: String)? {
         if let audioLanguage {
             let name = Locale.current.localizedString(forIdentifier: audioLanguage) ?? audioLanguage
             return (language: audioLanguage, name: name)
@@ -3453,6 +3520,28 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     }
 
     static let untaggedAtmosRenditionName = "Dolby Atmos"
+
+    /// AE#1049: the other audio tracks, named uniquely against the served rendition and each other.
+    /// Nothing without a served rendition: the alternates join its group and cannot form one alone.
+    var masterAudioAlternates: [AudioRenditionChoice] {
+        guard masterAudioRendition != nil,
+              audioMenuChoices.contains(where: { $0.trackID == servedAudioTrackID }) else { return [] }
+        return audioMenuChoices.filter { $0.trackID != servedAudioTrackID }
+    }
+
+    /// HLS requires NAME to be unique in a group, and AVFoundation folds equal names into one option.
+    /// Applied to the whole track list once, so every track keeps its name whichever one is served.
+    static func uniquelyNamed(_ choices: [AudioRenditionChoice]) -> [AudioRenditionChoice] {
+        var taken: Set<String> = []
+        return choices.map { choice in
+            var name = choice.name
+            var n = 2
+            while taken.contains(name) { name = "\(choice.name) \(n)"; n += 1 }
+            taken.insert(name)
+            return AudioRenditionChoice(trackID: choice.trackID, language: choice.language,
+                                        name: name, channels: choice.channels)
+        }
+    }
 
     /// Apple HLS Authoring Spec 2.13 ("CHANNELS ... MUST be present") plus Dolby's DD+ Online
     /// Delivery Kit: the value is the count of decodable objects, a slash, then `JOC`. 16 is the
@@ -3493,13 +3582,24 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
     }
 
+    var nativeSubtitleHearingImpairedOrdinals: Set<Int> {
+        Set(nativeSubRenditionInfos.indices.filter { nativeSubRenditionInfos[$0].isHearingImpaired })
+    }
+
     /// WebVTT for one subtitle segment: the cues overlapping video segment `segmentIndex`'s [start, end) on
     /// the AVPlayer timeline. `segments[i].startSeconds` is the absolute output-axis start (correct for both
     /// VOD and the live sliding window, where a cumulative EXTINF sum from firstVisible would not be), so the
     /// window is read straight off the segment plan rather than recomputed.
+    func nativeSubtitleServesSilently(ordinal: Int) -> Bool {
+        ordinal >= 0 && ordinal < nativeSubStores.count && nativeSubStores[ordinal].servesSilently
+    }
+
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal >= 0, ordinal < nativeSubStores.count else { return nil }
         let store = nativeSubStores[ordinal]
+        if store.servesSilently, nativeSubtitleWholeProgram {
+            return WebVTTBuilder.body(cues: [])   // AE#1052: a menu marker, nothing to draw
+        }
         if nativeSubtitleWholeProgram {
             // Sodalite#32: serve the ENTIRE program's cues as one .vtt (the only AVPlayer-reliable sideload
             // shape). AVKit fetches this VOD single-segment file ONCE and never re-fetches it, so it MUST be
@@ -3542,6 +3642,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let start = segments[segmentIndex].startSeconds
         let end = start + segments[segmentIndex].durationSeconds
         stateLock.unlock()
+        // AE#1052: a menu marker. No wait, no cues; AVKit fetches again when the marker becomes the display.
+        if store.servesSilently { return WebVTTBuilder.segment(cues: [], segmentStart: start) }
         // Sodalite#32: bounded, distance-aware readiness wait replacing the 25 s wait-for-isFinished. AVKit
         // caches an empty-served window forever, so waiting is worth it; but blocking every fetch on a store
         // that never finishes serialized the loopback connection AVPlayer also uses for video (device:

@@ -11,7 +11,7 @@ import AetherLibavcodec
 /// deadline against the render clock, not by a count of newer base frames, and at once when the access
 /// unit carried no enhancement layer. Everything is synthetic: tagged pixel buffers into the frame
 /// handlers, a recording composer, an injected clock and uptime, no media and no GPU.
-@Suite(.serialized, .timeLimit(.minutes(2)))
+@Suite(.serialized, .timeLimit(.minutes(3)))
 struct DualLayerDeadlineBypassTests {
 
     // MARK: - Fixtures
@@ -285,6 +285,7 @@ struct DualLayerDeadlineBypassTests {
         r.clocks.prerolling = true
         defer { r.decoder.close() }
         let renderer = SampleBufferRenderer()
+        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
         renderer.setFELLookahead(enabled: true, frameRate: 24)
         renderer.setArrivalOrderHandover(frameRate: 24)
         // The seek lands at 20.0 s with the clock held at rate 0. Frame 1's enhancement layer is lost;

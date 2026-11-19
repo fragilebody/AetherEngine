@@ -21,7 +21,7 @@ final class AudioAVPlayerHost {
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     /// The item has played and is now starved: AVPlayer is `waitingToPlayAtSpecifiedRate`, or it posted
     /// `AVPlayerItemPlaybackStalled` and has not resumed since. The engine folds this into `isBuffering`,
-    /// so `playbackPhase` reads `.rebuffering` on this path too (architecture.md promised that; the flag
+    /// so `playbackPhase` reads `.rebuffering` on this path too (the architecture docs promised that; the flag
     /// never existed). Startup spin-up before the first `.playing` is not a rebuffer, and a paused player
     /// is never one. See `rebufferingFlag(hasStartedPlaying:status:waitingReason:stalledSinceLastPlaying:)`.
     @Published private(set) var isRebuffering: Bool = false
@@ -34,7 +34,7 @@ final class AudioAVPlayerHost {
     /// Created once, reused across replaceCurrentItem swaps for the host's lifetime.
     let avPlayer = AVPlayer()
 
-    #if os(tvOS) || os(iOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     /// Now-Playing session bound to THIS player. The SHARED MPRemoteCommandCenter / MPNowPlayingInfoCenter aren't
     /// reliably bound to a bare AVPlayer: on background pause (rate 0) the app is dropped as active Now-Playing app
     /// and the shared center stops receiving ANY command (play button never returns). Binding a session keeps
@@ -74,6 +74,23 @@ final class AudioAVPlayerHost {
 
     private var lastRate: Float = 1.0
 
+    // MARK: - Normalization (Sodalite#242)
+
+    /// The track's loudness correction in dB, nil for none. Set before `load`; change it on a running
+    /// item with `setNormalizationGain(_:)`.
+    var normalizationGainDB: Double?
+    /// The tap carrying the gain on the current item, nil when none is installed.
+    private var normalizationTap: NormalizationTap?
+    /// Why the tap could not be installed, for the report; nil when it is (or nothing was asked).
+    private var normalizationTapRefusal: String?
+    /// The part of the gain `avPlayer.volume` carries when there is no tap: a cut, never a lift.
+    private var volumeFallbackFactor: Float = 1
+    /// The host's volume as the engine set it, before the fallback factor.
+    private var hostVolume: Float = 1
+    /// Bumped by every `load` and `stop`, so a load that awaited the asset's tracks can tell a newer
+    /// one replaced it and must not put its item back on the shared player.
+    private var loadToken: UInt64 = 0
+
     /// Start-position seconds stashed at load(); performed once readyToPlay, then cleared.
     private var pendingSeek: Double?
 
@@ -84,7 +101,7 @@ final class AudioAVPlayerHost {
     /// Per-item Now-Playing dictionary (MPMediaItemProperty keys + the host's force-decoded, @Sendable-wrapped
     /// MPMediaItemArtwork) that the auto-publishing MPNowPlayingSession reads from AVPlayerItem.nowPlayingInfo.
     /// Stashed so a back-to-back item swap (replaceCurrentItem) replays it onto the new item.
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     private var pendingNowPlayingInfo: [String: Any] = [:]
     #endif
 
@@ -96,7 +113,7 @@ final class AudioAVPlayerHost {
         self.ownsNowPlaying = ownsNowPlaying
         self.diagnosticPool = diagnosticPool
         self.diagnosticRead = diagnosticRead
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         nowPlayingSession = MPNowPlayingSession(players: [avPlayer])
         // Apple's documented path for a bare AVPlayer (WWDC22 110338, MPNowPlayingSession.h): the session
         // auto-publishes Now-Playing from the player (elapsed/rate/state/duration) merged with the per-item
@@ -113,7 +130,7 @@ final class AudioAVPlayerHost {
     /// Re-assert this session as active Now-Playing app on track start, reclaiming ownership if lost (keeps the
     /// Home overlay + remote commands alive across a background pause).
     func becomeActiveNowPlaying() {
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         guard ownsNowPlaying else { return }
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
@@ -131,14 +148,24 @@ final class AudioAVPlayerHost {
         } else {
             asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders])
         }
+        loadToken &+= 1
+        let token = loadToken
         let item = AVPlayerItem(asset: asset)
         AudioRatePolicy.apply(to: item)
+        // Sodalite#242: the mix has to be on the item before AVPlayer renders a sample of it, or the
+        // first moments of a lifted track play at the source level.
+        await installNormalization(on: item, asset: asset, token: token)
+        guard token == loadToken else {
+            EngineLog.emit("[AudioAVPlayerHost] load superseded while preparing normalization; item dropped",
+                           category: .swPlayback)
+            return
+        }
         // externalMetadata is unavailable on macOS (package builds there for tests/aetherctl).
         #if !os(macOS)
         item.externalMetadata = pendingExternalMetadata
         #endif
         // Stamp the per-item Now-Playing dict the auto-publishing session reads (iOS/tvOS 16+). Replays across swaps.
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         item.nowPlayingInfo = pendingNowPlayingInfo.isEmpty ? nil : pendingNowPlayingInfo
         #endif
         playerItem = item
@@ -180,7 +207,7 @@ final class AudioAVPlayerHost {
 
         // Status KVO: readyToPlay publishes duration + isReady and performs the pending seek; failed publishes the
         // error. Observer hops to its own queue, so round-trip back to MainActor.
-        statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        statusObservation = item.observe(\.status, options: []) { [weak self] item, _ in
             switch item.status {
             case .readyToPlay:
                 Task { @MainActor [weak self] in
@@ -221,7 +248,7 @@ final class AudioAVPlayerHost {
         }
 
         // Mirror player rate into published `rate`. timeControlStatus and rate move together; rate is simplest.
-        rateObservation = avPlayer.observe(\.rate, options: [.new]) { [weak self] player, _ in
+        rateObservation = avPlayer.observe(\.rate, options: []) { [weak self] player, _ in
             let r = player.rate
             Task { @MainActor [weak self] in
                 self?.rate = r
@@ -230,7 +257,7 @@ final class AudioAVPlayerHost {
 
         // Mirror timeControlStatus so the engine reconciles transport on system-driven play/pause, and fold
         // it into the rebuffer flag: the first `.playing` opens the window in which a wait is a stall.
-        timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+        timeControlObservation = avPlayer.observe(\.timeControlStatus, options: []) { [weak self] player, _ in
             let status = player.timeControlStatus
             let reason = player.reasonForWaitingToPlay?.rawValue
             Task { @MainActor [weak self] in
@@ -244,7 +271,7 @@ final class AudioAVPlayerHost {
                 self.refreshRebuffering()
             }
         }
-        waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: [.new]) { [weak self] player, _ in
+        waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: []) { [weak self] player, _ in
             // A cleared reason arrives just ahead of the status that ends the wait; that edge settles it.
             guard let reason = player.reasonForWaitingToPlay?.rawValue else { return }
             Task { @MainActor [weak self] in
@@ -353,7 +380,7 @@ final class AudioAVPlayerHost {
     /// Stage the per-item Now-Playing dictionary (current and subsequent items). The auto-publishing session merges
     /// these keys with the player's elapsed/rate/duration. Pass an empty dict to clear. Writing the per-item
     /// AVPlayerItem.nowPlayingInfo property is the documented, queue-safe channel (no MPNowPlayingInfoCenter write).
-    #if os(iOS) || os(tvOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     func setNowPlayingInfo(_ info: [String: Any]) {
         pendingNowPlayingInfo = info
         playerItem?.nowPlayingInfo = info.isEmpty ? nil : info
@@ -402,6 +429,7 @@ final class AudioAVPlayerHost {
     }
 
     func stop() {
+        loadToken &+= 1
         teardownObservers()
         avPlayer.pause()
         avPlayer.replaceCurrentItem(with: nil)
@@ -413,7 +441,7 @@ final class AudioAVPlayerHost {
         isRebuffering = false
         // Clear the staged dict so the next track starts clean; the auto-publishing session drops the Now-Playing
         // entry when the player has no current item.
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         pendingNowPlayingInfo = [:]
         #endif
         // Host is persistent across tracks; clear terminal flags so the next load's subscriptions (wired before
@@ -424,8 +452,120 @@ final class AudioAVPlayerHost {
     }
 
     var volume: Float {
-        get { avPlayer.volume }
-        set { avPlayer.volume = newValue }
+        get { hostVolume }
+        set {
+            hostVolume = newValue
+            avPlayer.volume = newValue * volumeFallbackFactor
+        }
+    }
+
+    // MARK: - Normalization
+
+    /// Builds the tap for `item`, or, when the asset has no audio track to bind it to or MediaToolbox
+    /// refuses one, lets `avPlayer.volume` carry the cut part of the gain.
+    private func installNormalization(on item: AVPlayerItem, asset: AVURLAsset, token: UInt64) async {
+        normalizationTap = nil
+        normalizationTapRefusal = nil
+        setVolumeFallback(nil)
+        guard let gain = normalizationGainDB.map(NormalizationGainProcessor.clampedGainDB) else { return }
+        let track: AVAssetTrack?
+        var refusal: String?
+        do {
+            track = try await asset.loadTracks(withMediaType: .audio).first
+        } catch {
+            track = nil
+            refusal = "audio track did not load (\(error.localizedDescription))"
+        }
+        // Audit AUD-204: the tap, the refusal and the volume cut are the host's, and a newer load owns
+        // them once it has started. Only the item this load built is still its own.
+        guard token == loadToken else { return }
+        normalizationTapRefusal = refusal
+        attachTap(gainDB: gain, item: item, track: track)
+    }
+
+    private func attachTap(gainDB: Double, item: AVPlayerItem, track: AVAssetTrack?) {
+        guard let track else {
+            if normalizationTapRefusal == nil { normalizationTapRefusal = "asset has no audio track" }
+            setVolumeFallback(gainDB)
+            return
+        }
+        guard let tap = NormalizationTap(gainDB: gainDB) else {
+            normalizationTapRefusal = "MTAudioProcessingTapCreate failed"
+            setVolumeFallback(gainDB)
+            return
+        }
+        normalizationTap = tap
+        normalizationTapRefusal = nil
+        setVolumeFallback(nil)
+        item.audioMix = tap.audioMix(for: track)
+        EngineLog.emit(String(format: "[AudioAVPlayerHost] normalization tap installed, gain %+.1f dB", gainDB),
+                       category: .swPlayback)
+    }
+
+    /// nil clears the fallback; a gain puts its cut part (never a lift) on `avPlayer.volume`.
+    private func setVolumeFallback(_ gainDB: Double?) {
+        volumeFallbackFactor = gainDB.map { Float(pow(10, min(0, $0) / 20)) } ?? 1
+        avPlayer.volume = hostVolume * volumeFallbackFactor
+        if let gainDB {
+            EngineLog.emit(String(format: "[AudioAVPlayerHost] normalization without a tap (%@): "
+                                  + "volume carries %+.1f dB of %+.1f dB", normalizationTapRefusal ?? "-",
+                                  min(0, gainDB), gainDB), category: .swPlayback)
+        }
+    }
+
+    /// Change the gain on the running item. A tap already in place ramps to it; otherwise one is
+    /// installed on the item now.
+    func setNormalizationGain(_ gainDB: Double?) {
+        normalizationGainDB = gainDB
+        let clamped = gainDB.map(NormalizationGainProcessor.clampedGainDB)
+        if let tap = normalizationTap {
+            // Kept at 0 dB rather than removed: swapping the mix mid-item can drop a buffer.
+            tap.context.setGainDB(clamped ?? 0)
+            return
+        }
+        guard let item = playerItem else { return }
+        guard let clamped else {
+            setVolumeFallback(nil)
+            return
+        }
+        let track = item.tracks.lazy.compactMap(\.assetTrack).first { $0.mediaType == .audio }
+        attachTap(gainDB: clamped, item: item, track: track)
+    }
+
+    /// visionOS has no external playback on AVPlayer.
+    private var externalPlaybackActive: Bool {
+        #if os(visionOS)
+        false
+        #else
+        avPlayer.isExternalPlaybackActive
+        #endif
+    }
+
+    /// What normalization did on the current item; nil when none was asked for and none ran.
+    var normalizationReport: NormalizationGainReport? {
+        let requested = normalizationGainDB.map(NormalizationGainProcessor.clampedGainDB)
+        if let tap = normalizationTap {
+            let stats = tap.context.statistics
+            switch tap.context.preparation {
+            case .unsupported(let format):
+                return NormalizationGainReport(requestedDB: requested ?? 0, appliedDB: 0, host: .avPlayer,
+                                               stage: .none, statistics: stats,
+                                               note: "tap got a format it does not read (\(format))")
+            case .pending, .running:
+                let ran = (stats?.frames ?? 0) > 0
+                let note: String? = !ran ? "tap has not processed audio yet"
+                    : externalPlaybackActive ? "external playback active, the receiver may render the source"
+                    : nil
+                return NormalizationGainReport(requestedDB: requested ?? 0, appliedDB: ran ? tap.context.gainDB : 0,
+                                               host: .avPlayer, stage: ran ? .tap : .none, statistics: stats,
+                                               note: note)
+            }
+        }
+        guard let requested else { return nil }
+        let applied = min(0, requested)
+        return NormalizationGainReport(requestedDB: requested, appliedDB: applied, host: .avPlayer,
+                                       stage: applied < 0 ? .volume : .none, statistics: nil,
+                                       note: normalizationTapRefusal)
     }
 
     // MARK: - Internal

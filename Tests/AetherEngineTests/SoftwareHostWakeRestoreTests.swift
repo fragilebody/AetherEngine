@@ -10,7 +10,7 @@ import Testing
 /// The rebuild is the host's call (`needsForegroundVideoRestore`, then `reloadAtCurrentPosition`).
 /// This pins that the rebuild alone brings the session back where it was, paused, with the card and
 /// the remote commands answering again.
-@Suite("Software host: restore after a background teardown", .serialized, .timeLimit(.minutes(2)))
+@Suite("Software host: restore after a background teardown", .serialized, .timeLimit(.minutes(3)))
 @MainActor
 struct SoftwareHostWakeRestoreTests {
 
@@ -18,15 +18,17 @@ struct SoftwareHostWakeRestoreTests {
 
     @MainActor
     private final class Sink: SoftwareNowPlayingSink {
-        var handler: (@MainActor (SoftwareNowPlayingCommand) -> Void)?
+        var handler: (@MainActor (NowPlayingRemoteCommand) -> Void)?
         var deactivated = false
         var lastState: MPNowPlayingPlaybackState = .unknown
-        func activate(skipInterval: Double, handler: @escaping @MainActor (SoftwareNowPlayingCommand) -> Void) {
+        func activate(skipInterval: Double, handler: @escaping @MainActor (NowPlayingRemoteCommand) -> Void) {
             self.handler = handler
         }
         func setSeekingEnabled(_ enabled: Bool) {}
         func publish(info: [String: Any]?, playbackState: MPNowPlayingPlaybackState) { lastState = playbackState }
-        func deactivate() { deactivated = true; handler = nil }
+        func setTrackCommands(_ tracks: NowPlayingTrackAvailability) {}
+        func deactivate(clearCard: Bool) { deactivated = true; handler = nil }
+        func clearCard() {}
     }
 
     @Test("a paused session torn down for the background comes back paused, with Now-Playing and the remote")
@@ -37,7 +39,8 @@ struct SoftwareHostWakeRestoreTests {
         engine.volume = 0
         engine.ownsSoftwareNowPlaying = true
         var sinks: [Sink] = []
-        engine.makeSoftwareNowPlayingSink = {
+        engine.nowPlayingArbiter = NowPlayingArbiter()
+        engine.makeNowPlayingSink = { _, _ in
             let sink = Sink()
             sinks.append(sink)
             return sink
