@@ -124,3 +124,9 @@ luma doubler for anime, on the upscale route the line-art scaler opened (SDR 8 o
 - `aetherctl play --artcnn c4f16|c4f32`; `aetherctl bench` has ArtCNN cases.
 - Tests: `ArtCNNStageTests.swift` (against `ArtCNNReferenceData.swift`, made by `Scripts/artcnn-reference.py`
   from ArtCNN's ONNX models with onnxruntime).
+
+## 10-bit SDR decodes at 10 bits
+
+`VideoToolboxVideoFormat.decodesAtTenBits` takes an HEVC or AV1 stream's depth from its pixel format before
+`bits_per_raw_sample`, which FFmpeg leaves unset for HEVC in MP4 and Matroska. Upstream decoded such a 10-bit
+SDR source (most anime encodes) to 8 bits on the software path, before the upscale and dither stages saw it.

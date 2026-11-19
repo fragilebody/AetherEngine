@@ -46,6 +46,19 @@ enum VideoToolboxVideoFormat {
         }
     }
 
+    /// Whether VideoToolbox should hand out 10-bit buffers for an HEVC or AV1 stream: a source deeper than
+    /// 8 bits, or an HDR transfer. Fork: the depth comes from the stream's pixel format first. FFmpeg leaves
+    /// `bits_per_raw_sample` unset for HEVC in MP4 and Matroska, so a 10-bit SDR source (most anime encodes)
+    /// was decoded to 8 bits on the software path before any stage saw it.
+    static func decodesAtTenBits(_ codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
+        if ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc) { return true }
+        let format = AVPixelFormat(rawValue: codecpar.pointee.format)
+        if format != AV_PIX_FMT_NONE, let desc = av_pix_fmt_desc_get(format) {
+            return desc.pointee.comp.0.depth > 8
+        }
+        return codecpar.pointee.bits_per_raw_sample > 8
+    }
+
     static func make(stream: UnsafeMutablePointer<AVStream>) throws -> Configuration {
         guard let codecpar = stream.pointee.codecpar else {
             throw VideoDecoderError.noCodecParameters
@@ -64,8 +77,7 @@ enum VideoToolboxVideoFormat {
                 kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms
             ])
             addColor(codecpar: codecpar, to: extensions)
-            let bitDepth = codecpar.pointee.bits_per_raw_sample > 8
-                || ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc) ? 10 : 8
+            let bitDepth = decodesAtTenBits(codecpar) ? 10 : 8
             return Configuration(
                 codecName: "HEVC",
                 codecType: kCMVideoCodecType_HEVC,
@@ -86,8 +98,7 @@ enum VideoToolboxVideoFormat {
                 kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms
             ])
             addColor(codecpar: codecpar, to: extensions)
-            let bitDepth = codecpar.pointee.bits_per_raw_sample > 8
-                || ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc) ? 10 : 8
+            let bitDepth = decodesAtTenBits(codecpar) ? 10 : 8
             return Configuration(
                 codecName: "AV1",
                 codecType: kCMVideoCodecType_AV1,
