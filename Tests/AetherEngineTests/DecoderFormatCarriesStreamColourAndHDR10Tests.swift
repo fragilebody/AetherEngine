@@ -52,6 +52,37 @@ struct DecoderFormatCarriesStreamColourAndHDR10Tests {
         #expect(fullRange == false)
     }
 
+    /// Fork: a 10-bit SDR HEVC stream whose `bits_per_raw_sample` FFmpeg left unset (MP4, Matroska) still
+    /// decodes at 10 bits, from its pixel format; 8-bit SDR stays at 8, and HDR is 10 whatever it says.
+    @Test(arguments: [
+        (AV_PIX_FMT_YUV420P10LE, AVCOL_TRC_BT709, Int32(0), 10),
+        (AV_PIX_FMT_YUV420P, AVCOL_TRC_BT709, Int32(0), 8),
+        (AV_PIX_FMT_NONE, AVCOL_TRC_BT709, Int32(10), 10),
+        (AV_PIX_FMT_NONE, AVCOL_TRC_BT709, Int32(0), 8),
+        (AV_PIX_FMT_YUV420P, AVCOL_TRC_SMPTE2084, Int32(0), 10),
+    ])
+    func tenBitSDRDecodesAtTenBits(format: AVPixelFormat, transfer: AVColorTransferCharacteristic,
+                                   rawBits: Int32, expected: Int) throws {
+        let context = try #require(avformat_alloc_context())
+        defer { avformat_free_context(context) }
+        let stream = try #require(avformat_new_stream(context, nil))
+        let parameters = try #require(stream.pointee.codecpar)
+        parameters.pointee.codec_id = AV_CODEC_ID_HEVC
+        parameters.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+        parameters.pointee.width = 1920
+        parameters.pointee.height = 1080
+        parameters.pointee.format = format.rawValue
+        parameters.pointee.bits_per_raw_sample = rawBits
+        parameters.pointee.color_trc = transfer
+        let record = [UInt8](repeating: 0, count: 23)
+        let extradata = try #require(av_mallocz(record.count + 64)?.assumingMemoryBound(to: UInt8.self))
+        extradata.update(from: record, count: record.count)
+        extradata[0] = 1
+        parameters.pointee.extradata = extradata
+        parameters.pointee.extradata_size = Int32(record.count)
+        #expect(try VideoToolboxVideoFormat.make(stream: stream).bitDepth == expected)
+    }
+
     @Test func issue957TheHDR10ValuesKnownAtOpenGoIntoTheDescription() {
         let base: NSDictionary = [kCMFormatDescriptionExtension_TransferFunction:
                                     kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ]

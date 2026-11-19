@@ -106,3 +106,9 @@ Files touched: `PlayerState.swift`, `AetherEngine+Loading.swift`, `AetherEngine+
 Engine log lines no longer go to OSLog (and so the Xcode/terminal console) unless the `AETHER_LOG`
 environment variable is set to a value other than `0`. Host handlers (`EngineLog.handler`) still get
 every `.info` line. See `EngineLog.osLogEnabled`.
+
+## 10-bit SDR decodes at 10 bits
+
+`VideoToolboxVideoFormat.decodesAtTenBits` takes an HEVC or AV1 stream's depth from its pixel format before
+`bits_per_raw_sample`, which FFmpeg leaves unset for HEVC in MP4 and Matroska. Upstream decoded such a 10-bit
+SDR source (most anime encodes) to 8 bits on the software path, before the upscale and dither stages saw it.

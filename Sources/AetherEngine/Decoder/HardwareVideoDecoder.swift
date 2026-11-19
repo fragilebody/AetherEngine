@@ -387,7 +387,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
         ]
 
-        // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for Metal rendering.
+        // 3. Pixel buffer attributes: 10-bit biplanar for a 10-bit or HDR source, else 8-bit; IOSurface-backed for Metal.
         let use10Bit = configuration.bitDepth > 8
 
         streamColor = ColorDescription(codecpar: codecpar)
