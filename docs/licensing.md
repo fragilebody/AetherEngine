@@ -13,6 +13,7 @@ What you have to do to ship AetherEngine and its dependencies in an app, App Sto
 | DTS:X decoding | Part of FFmpeg | Nothing extra | Nothing beyond FFmpeg |
 | SMBClient | MIT | Only if you link `AetherEngineSMB` | Show its notice |
 | Anime4K | MIT | Compiled in (the line-art scaler's kernels) | Show bloc97's notice |
+| ArtCNN (fork) | MIT | Compiled in (the ArtCNN scaler's kernels and weights) | Show the ArtCNN authors' notice |
 
 ## AetherEngine
 
@@ -64,6 +65,10 @@ Earlier releases linked LibDTSX instead. The engine no longer does, because its 
 ## Anime4K
 
 The line-art scaler (`LoadOptions.upscaleScaler = .lineArt`) runs [Anime4K](https://github.com/bloc97/Anime4K)'s Upscale CNN x2 (S), Copyright (c) 2019-2021 bloc97, MIT. Its weights are compiled into the engine as Metal source, whether or not a host uses the option. That file (`Sources/AetherEngine/Video/Metal/LineArtShaderSource.swift`) carries the full notice. MIT requires the copyright notice to travel with the binary, so **bloc97's notice** belongs on your acknowledgements screen.
+
+## ArtCNN (fork)
+
+The ArtCNN scaler (`LoadOptions.upscaleScaler = .artCNN(...)`) runs [ArtCNN](https://github.com/Artoriuz/ArtCNN)'s C4F16 and C4F32, Copyright (c) 2024 Joao Chrisostomo, Kacper Michajłow, MIT. Their weights are compiled into the engine as Metal source and a float16 table, whether or not a host uses the option. That file (`Sources/AetherEngine/Video/Metal/ArtCNNShaderSource.swift`) carries the full notice, which belongs on your acknowledgements screen like bloc97's.
 
 ## Linking the engine statically
 

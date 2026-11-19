@@ -63,6 +63,13 @@ extension AetherEngine {
                 stageFailedEarlier: { UpscaleFailureMemory.contains($0, frameRate: frameRate) })
         }
         let decision = decide(options.upscaleScaler)
+        // Fork: ArtCNN whose lightest model overran here before leaves the source alone.
+        if let plan = decision.plan, plan.scaler.artCNNModel != nil,
+           let overrun = ArtCNNCostMemory.overrun(covering: plan, frameInterval: frameRate.map { 1 / $0 }, model: .c4f16) {
+            EngineLog.emit(String(format: "[Upscale] ArtCNN C4F16 overran on this device earlier (%.1f ms at %.1f ms), "
+                                  + "not upscaling", overrun.meanMs, overrun.frameInterval * 1000), category: .engine)
+            return .notTaken(.stageFailedEarlier)
+        }
         // AE#1039: line art that overran here before starts on the rung it fell back to.
         if let plan = decision.plan, plan.scaler == .lineArt,
            let overrun = LineArtCostMemory.overrun(covering: plan, frameInterval: frameRate.map { 1 / $0 }, rung: .upscale) {

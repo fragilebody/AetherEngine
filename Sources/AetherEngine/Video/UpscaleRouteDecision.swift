@@ -31,6 +31,9 @@ struct UpscalePlan: Hashable, Sendable {
     var displayWidth: Int
     var displayHeight: Int
     var scaler: UpscaleScaler = .automatic
+    /// The source's pixel aspect, for a plan whose target keeps the coded shape (`.artCNN`, exactly 2x).
+    var sarNum = 1
+    var sarDen = 1
 
     var needsMetalFX: Bool {
         scaler == .automatic && (mlOutputWidth != targetWidth || mlOutputHeight != targetHeight)
@@ -58,6 +61,8 @@ enum UpscaleRouteDecision: Equatable {
         /// `.lineArt` only: wider than 1920 or taller than 1080.
         case largerThan1080p
         case displayNotLarger
+        /// `.artCNN` only: the display box is not 1.3x the source on both axes (mpv's condition).
+        case displayUnderArtCNNThreshold
         case wirelessAirPlayRoute
         case demuxedAudioLive
         case stageFailedEarlier
@@ -76,11 +81,14 @@ enum UpscaleRouteDecision: Equatable {
         guard isSDR, !isDolbyVision else { return .notTaken(.hdrOrDolbyVision) }
         switch scaler {
         case .automatic: guard isEightBit420 else { return .notTaken(.notEightBit420) }
-        case .lineArt: guard isEightBit420 || isTenBit420 else { return .notTaken(.notFourTwoZero) }
+        case .lineArt, .artCNN: guard isEightBit420 || isTenBit420 else { return .notTaken(.notFourTwoZero) }
         }
         guard source.width > 0, source.height > 0 else { return .notTaken(.geometryUnknown) }
         guard sizeAllowed(width: source.width, height: source.height, scaler: scaler) else {
-            return .notTaken(scaler == .lineArt ? .largerThan1080p : .notBelow1080p)
+            return .notTaken(scaler.isNetwork2x ? .largerThan1080p : .notBelow1080p)
+        }
+        if case .artCNN = scaler, !meetsArtCNNThreshold(source: source, display: display) {
+            return .notTaken(.displayUnderArtCNNThreshold)
         }
         guard let plan = makePlan(source: source, display: display, mlScaleFactors: mlScaleFactors, scaler: scaler),
               plan.targetWidth > source.width || plan.targetHeight > source.height
@@ -122,20 +130,25 @@ enum UpscaleRouteDecision: Equatable {
     static func sizeAllowed(width: Int, height: Int, scaler: UpscaleScaler) -> Bool {
         switch scaler {
         case .automatic: return width < 1920 && height < 1080
-        case .lineArt: return width <= 1920 && height <= 1080
+        case .lineArt, .artCNN: return width <= 1920 && height <= 1080
         }
     }
 
-    /// The plan for `source` on `display`, or nil when either size is not positive. Also used to rebuild
-    /// the plan when the decoded size changes mid-stream.
-    static func makePlan(
-        source: SourceGeometry, display: CGSize, mlScaleFactors: (Int, Int) -> [Float],
-        scaler: UpscaleScaler = .automatic
-    ) -> UpscalePlan? {
+    /// mpv runs ArtCNN only when the output is more than 1.3x the source on both axes (its `WHEN`); here the
+    /// output is the source's display aspect fitted into the display box.
+    static func meetsArtCNNThreshold(source: SourceGeometry, display: CGSize) -> Bool {
+        guard let fitted = fittedTarget(source: source, display: display) else { return false }
+        let sar = source.effectiveSAR
+        // The fitted box is in square pixels; the source's width in square pixels is width * SAR.
+        let squareWidth = Double(source.width * sar.num) / Double(sar.den)
+        return Double(fitted.width) > 1.3 * squareWidth && Double(fitted.height) > 1.3 * Double(source.height)
+    }
+
+    /// The source's display aspect fitted into the display box, even, or nil when either size is not positive.
+    static func fittedTarget(source: SourceGeometry, display: CGSize) -> (width: Int, height: Int)? {
         let displayW = Int(display.width.rounded(.down))
         let displayH = Int(display.height.rounded(.down))
         guard source.width > 0, source.height > 0, displayW > 0, displayH > 0 else { return nil }
-
         let sar = source.effectiveSAR
         let aspect = Double(source.width * sar.num) / Double(source.height * sar.den)
         var targetW = displayW
@@ -147,6 +160,28 @@ enum UpscaleRouteDecision: Equatable {
         targetW = even(min(targetW, displayW))
         targetH = even(min(targetH, displayH))
         guard targetW > 0, targetH > 0 else { return nil }
+        return (targetW, targetH)
+    }
+
+    /// The plan for `source` on `display`, or nil when either size is not positive. Also used to rebuild
+    /// the plan when the decoded size changes mid-stream.
+    static func makePlan(
+        source: SourceGeometry, display: CGSize, mlScaleFactors: (Int, Int) -> [Float],
+        scaler: UpscaleScaler = .automatic
+    ) -> UpscalePlan? {
+        guard let (targetW, targetH) = fittedTarget(source: source, display: display) else { return nil }
+        let displayW = Int(display.width.rounded(.down))
+        let displayH = Int(display.height.rounded(.down))
+
+        if case .artCNN = scaler {
+            // Exactly 2x the coded picture, keeping its pixel shape: the display layer scales the rest.
+            let sar = source.effectiveSAR
+            return UpscalePlan(
+                sourceWidth: source.width, sourceHeight: source.height, mlScale: nil,
+                mlOutputWidth: source.width * 2, mlOutputHeight: source.height * 2,
+                targetWidth: source.width * 2, targetHeight: source.height * 2,
+                displayWidth: displayW, displayHeight: displayH, scaler: scaler, sarNum: sar.num, sarDen: sar.den)
+        }
 
         if scaler == .lineArt {
             return UpscalePlan(
@@ -228,6 +263,9 @@ enum UpscaleRouteDecision: Equatable {
         switch self {
         case .notTaken(.preferenceOff):
             return nil
+        case let .taken(plan) where plan.scaler.artCNNModel != nil:
+            return "[Upscale] taken: \(plan.sourceWidth)x\(plan.sourceHeight) -> \(plan.targetWidth)x\(plan.targetHeight) "
+                + "(ArtCNN \(plan.scaler.artCNNModel!.rawValue.uppercased()) 2x)"
         case let .taken(plan) where plan.scaler == .lineArt:
             let rest = plan.mlOutputWidth == plan.targetWidth && plan.mlOutputHeight == plan.targetHeight
                 ? "" : ", then bilinear"
@@ -259,6 +297,7 @@ extension UpscaleRouteDecision.Reason {
         case .notBelow1080p: return "source is not below 1080p"
         case .largerThan1080p: return "source is larger than 1920x1080"
         case .displayNotLarger: return "display is not larger than the source"
+        case .displayUnderArtCNNThreshold: return "display is not 1.3x the source on both axes (ArtCNN)"
         case .wirelessAirPlayRoute: return "a wireless AirPlay receiver holds the audio route"
         case .demuxedAudioLive: return "live stream with demuxed audio"
         case .stageFailedEarlier: return "the stage disabled itself for this plan earlier in this process"
@@ -339,6 +378,40 @@ enum LineArtCostMemory {
         lock.lock(); defer { lock.unlock() }
         let pixels = plan.sourceWidth * plan.sourceHeight
         return (overruns[rung] ?? []).first { o in
+            guard let frameInterval else { return pixels >= o.pixels }
+            return o.covers(pixels: pixels, frameInterval: frameInterval)
+        }
+    }
+
+    static func reset() {
+        lock.lock(); overruns.removeAll(); lock.unlock()
+    }
+}
+
+/// Fork: ArtCNN overruns seen in this process, per model, with `LineArtCostMemory`'s rule: a later source at
+/// least as large, at a frame interval no longer, would overrun again. A C4F32 overrun starts later stages on
+/// C4F16; a C4F16 overrun makes the load leave the source alone.
+enum ArtCNNCostMemory {
+    typealias Overrun = LineArtCostMemory.Overrun
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var overruns: [ArtCNNModel: [Overrun]] = [:]
+
+    static func record(_ overrun: Overrun, model: ArtCNNModel) {
+        lock.lock(); defer { lock.unlock() }
+        var list = overruns[model] ?? []
+        guard !list.contains(where: { $0.pixels <= overrun.pixels && $0.frameInterval >= overrun.frameInterval })
+        else { return }
+        list.removeAll { $0.pixels >= overrun.pixels && $0.frameInterval <= overrun.frameInterval }
+        list.append(overrun)
+        overruns[model] = list
+    }
+
+    /// The overrun of `model` covering a plan for this source at `frameInterval` (unknown counts as covered).
+    static func overrun(covering plan: UpscalePlan, frameInterval: Double?, model: ArtCNNModel) -> Overrun? {
+        lock.lock(); defer { lock.unlock() }
+        let pixels = plan.sourceWidth * plan.sourceHeight
+        return (overruns[model] ?? []).first { o in
             guard let frameInterval else { return pixels >= o.pixels }
             return o.covers(pixels: pixels, frameInterval: frameInterval)
         }

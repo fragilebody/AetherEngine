@@ -106,3 +106,21 @@ Files touched: `PlayerState.swift`, `AetherEngine+Loading.swift`, `AetherEngine+
 Engine log lines no longer go to OSLog (and so the Xcode/terminal console) unless the `AETHER_LOG`
 environment variable is set to a value other than `0`. Host handlers (`EngineLog.handler`) still get
 every `.info` line. See `EngineLog.osLogEnabled`.
+
+## ArtCNN scaler
+
+**`LoadOptions.upscaleScaler = .artCNN(.c4f16 / .c4f32)`**: [ArtCNN](https://github.com/Artoriuz/ArtCNN) (MIT), a
+luma doubler for anime, on the upscale route the line-art scaler opened (SDR 8 or 10-bit 4:2:0 up to 1080p). See
+`docs/api.md` under `upscaleScaler` for what it does, costs and how it falls back.
+
+- `Scripts/generate-artcnn-shader.py` writes `Video/Metal/ArtCNNShaderSource.swift` from ArtCNN's GLSL (weights
+  unchanged): the GLSL passes as Metal kernels, the output pass, the hidden passes' weights as float16 and
+  `artcnnHiddenMatrix`, the matrix-unit kernel that replaces them on Apple7 GPUs.
+- `Video/Metal/ArtCNNStage.swift`: the stage and its per-model pipeline cache. It is the only planar stage:
+  `FrameChain` gained `FrameChainStage.isPlanar` / `encodePlanar` and `isPlanarOnly`, a chain that skips both
+  RGB conversions.
+- Route and ladder: `UpscaleRouteDecision` (`meetsArtCNNThreshold`, `fittedTarget`, `ArtCNNCostMemory`,
+  `UpscalePlan.sarNum/sarDen`), `FrameUpscaler.stepDownArtCNN`, `AetherEngine+Upscale.swift`.
+- `aetherctl play --artcnn c4f16|c4f32`; `aetherctl bench` has ArtCNN cases.
+- Tests: `ArtCNNStageTests.swift` (against `ArtCNNReferenceData.swift`, made by `Scripts/artcnn-reference.py`
+  from ArtCNN's ONNX models with onnxruntime).

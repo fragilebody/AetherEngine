@@ -72,7 +72,7 @@ func printUsage() {
       aetherctl swdecode [--frames N] <url>
       aetherctl bench [--iterations N] [--json out.json] [--baseline base.json] [--tolerance PCT]
       aetherctl bench --compare <base.json> <new.json> [--tolerance PCT]
-      aetherctl play [--fel [--fel-output]] [--upscale [--line-art]] [--tone-map NITS] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--standard-join] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel [--fel-output]] [--upscale [--line-art | --artcnn c4f16|c4f32]] [--tone-map NITS] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--standard-join] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
@@ -903,7 +903,16 @@ if first == "play" {
     // #846: `LoadOptions.upscalesLowResolutionVideo`, off by default as in the engine.
     // AE#1039: `LoadOptions.upscaleScaler = .lineArt`; implies --upscale.
     let playLineArt = takeFlag("--line-art", from: &rest)
-    let playUpscale = takeFlag("--upscale", from: &rest) || playLineArt
+    // Fork: `LoadOptions.upscaleScaler = .artCNN(...)`, c4f16 or c4f32; implies --upscale.
+    var playArtCNN: ArtCNNModel?
+    if let spec = takeStringFlag("--artcnn", from: &rest) {
+        guard let model = ArtCNNModel(rawValue: spec.lowercased()) else {
+            print("ERROR: --artcnn takes c4f16 or c4f32, got '\(spec)'")
+            exit(64)
+        }
+        playArtCNN = model
+    }
+    let playUpscale = takeFlag("--upscale", from: &rest) || playLineArt || playArtCNN != nil
     // #957: `LoadOptions.videoProcessing` with this target peak; off by default as in the engine.
     var playVideoProcessing: VideoProcessingOptions?
     if let spec = takeStringFlag("--tone-map", from: &rest) {
@@ -1271,7 +1280,7 @@ if first == "play" {
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
                  dualLayerRoute: playFelOutput ? .avPlayerOutput : .softwareHost,
                  upscalesLowResolutionVideo: playUpscale,
-                 upscaleScaler: playLineArt ? .lineArt : .automatic,
+                 upscaleScaler: playArtCNN.map { .artCNN($0) } ?? (playLineArt ? .lineArt : .automatic),
                  videoProcessing: playVideoProcessing,
                  videoDither: playDither ? VideoDitherOptions() : nil,
                  videoDeband: playDeband ? VideoDebandOptions() : nil,

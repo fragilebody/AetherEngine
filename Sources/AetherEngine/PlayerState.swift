@@ -603,6 +603,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// (the default) is the route described there. `.lineArt` replaces it with a 2x line-art network
     /// (Anime4K Upscale CNN S) made for animation, and widens the route to 1080p sources and 10-bit SDR.
     /// It suits drawn content only, so a host sets it per title (from the genre, or a per-show switch).
+    /// `.artCNN` (fork) runs ArtCNN instead, exactly 2x, with the same widened source rules.
     /// Ignored while `upscalesLowResolutionVideo` is off. A tuning field like it.
     public var upscaleScaler: UpscaleScaler = .automatic
 
@@ -2018,6 +2019,33 @@ public enum UpscaleScaler: Sendable, Hashable {
     /// A 2x line-art network for animation (Anime4K Upscale CNN S, half precision), then a bilinear
     /// resample to the target where 2x does not land on it. SDR 8 or 10-bit 4:2:0 up to 1920x1080.
     case lineArt
+    /// Fork: ArtCNN (Artoriuz/ArtCNN, MIT), a 2x luma network for anime, as mpv runs its GLSL shaders. Exactly
+    /// 2x the source: the display layer scales the rest. SDR 8 or 10-bit 4:2:0 up to 1920x1080, on a display
+    /// at least 1.3x the source on both axes (mpv's condition for the shader). A sustained overrun of
+    /// `.c4f32` steps down to `.c4f16`, and of `.c4f16` switches the stage off.
+    case artCNN(ArtCNNModel)
+
+    /// The 2x network scalers, which share the route's widened source rules (1080p, 10-bit).
+    var isNetwork2x: Bool {
+        switch self {
+        case .automatic: return false
+        case .lineArt, .artCNN: return true
+        }
+    }
+
+    /// The ArtCNN model, nil for the other scalers.
+    var artCNNModel: ArtCNNModel? {
+        if case .artCNN(let model) = self { return model }
+        return nil
+    }
+}
+
+/// Fork: the ArtCNN network `UpscaleScaler.artCNN` runs. Both double the luma; the chroma is scaled bilinearly.
+public enum ArtCNNModel: String, Sendable, Hashable, CaseIterable {
+    /// 4 blocks of 16 filters, about 12k multiply-adds per source pixel: real time at 1080p on an M-series GPU.
+    case c4f16
+    /// 4 blocks of 32 filters, about 4x C4F16: sharper; real time for SD, and 720p at 24 fps on a fast GPU.
+    case c4f32
 }
 
 /// What the low-resolution upscale stage is doing for the current session (#846), published as

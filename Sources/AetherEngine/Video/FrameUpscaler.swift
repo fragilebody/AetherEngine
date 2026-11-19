@@ -207,6 +207,17 @@ final class FrameUpscaler: @unchecked Sendable {
                            category: .swPlayback)
         }
         let restores = lineArtRestores
+        var plan = plan
+        if plan.scaler == .artCNN(.c4f32),
+           let overrun = ArtCNNCostMemory.overrun(covering: plan, frameInterval: frameInterval, model: .c4f32) {
+            plan.scaler = .artCNN(.c4f16)
+            scaler = plan.scaler
+            degraded = true
+            _isDegraded = true
+            EngineLog.emit(String(format: "[Upscale] ArtCNN starting on C4F16: C4F32 overran on this device earlier "
+                                  + "(%.1f ms at %.1f ms)", overrun.meanMs, overrun.frameInterval * 1000),
+                           category: .swPlayback)
+        }
         if mlOnly {
             degraded = true
             _isDegraded = true
@@ -317,7 +328,7 @@ final class FrameUpscaler: @unchecked Sendable {
         let format = CVPixelBufferGetPixelFormatType(input)
         lastInputEightBit = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        if built.plan.scaler == .lineArt {
+        if built.plan.scaler.isNetwork2x {
             guard FrameChain.supportedFormats.contains(format) else {
                 notePassThrough("pixel format \(fourCC(format)) is not 8 or 10-bit 4:2:0")
                 return .passThrough
@@ -488,11 +499,16 @@ final class FrameUpscaler: @unchecked Sendable {
 
     private func rebuild(for input: CVPixelBuffer, width: Int, height: Int) -> Bool {
         guard UpscaleRouteDecision.sizeAllowed(width: width, height: height, scaler: scaler) else {
-            notePassThrough("\(width)x\(height) is " + (scaler == .lineArt ? "larger than 1920x1080" : "not below 1080p"))
+            notePassThrough("\(width)x\(height) is " + (scaler.isNetwork2x ? "larger than 1920x1080" : "not below 1080p"))
             return false
         }
         let sar = Self.pixelAspectRatio(of: input)
         let display = CGSize(width: initialPlan.displayWidth, height: initialPlan.displayHeight)
+        if scaler.artCNNModel != nil, !UpscaleRouteDecision.meetsArtCNNThreshold(
+            source: SourceGeometry(width: width, height: height, sarNum: sar.0, sarDen: sar.1), display: display) {
+            notePassThrough("\(width)x\(height) is not 1.3x smaller than the display")
+            return false
+        }
         guard let plan = UpscaleRouteDecision.makePlan(
                 source: SourceGeometry(width: width, height: height, sarNum: sar.0, sarDen: sar.1),
                 display: display, mlScaleFactors: Self.mlScaleFactors, scaler: scaler),
@@ -592,7 +608,9 @@ final class FrameUpscaler: @unchecked Sendable {
         if recentTimes.count == Self.budgetWindow, windowMean.total > budgetMs {
             let over = String(format: "%.2f ms mean over %d frames against %.2f ms",
                               windowMean.total, Self.budgetWindow, budgetMs)
-            if stage.plan.scaler == .lineArt, lineArtRestores {
+            if let model = stage.plan.scaler.artCNNModel {
+                stepDownArtCNN(from: model, over: over, window: windowMean, plan: stage.plan)
+            } else if stage.plan.scaler == .lineArt, lineArtRestores {
                 dropLineArtRestore(over: over, window: windowMean, plan: stage.plan)
             } else if stage.plan.scaler == .lineArt {
                 fallBackFromLineArt(over: over, window: windowMean, plan: stage.plan)
@@ -602,6 +620,48 @@ final class FrameUpscaler: @unchecked Sendable {
                 disable(reason: "over budget, " + over)
             }
         }
+    }
+
+    /// Fork: an ArtCNN stage overran. Remembered per model for the process; C4F32 steps down to C4F16, built off
+    /// this thread while frames pass through (its kernels compile on first use), and C4F16 switches off.
+    private func stepDownArtCNN(from model: ArtCNNModel, over: String, window: StageTimes, plan: UpscalePlan) {
+        ArtCNNCostMemory.record(ArtCNNCostMemory.Overrun(
+            width: plan.sourceWidth, height: plan.sourceHeight, frameInterval: frameInterval, meanMs: window.total),
+            model: model)
+        guard model == .c4f32 else {
+            disable(reason: "over budget, " + over)
+            return
+        }
+        var lighter = plan
+        lighter.scaler = .artCNN(.c4f16)
+        EngineLog.emit("[Upscale] degraded: ArtCNN C4F32 over budget (\(over)), stepping down to C4F16 "
+                       + "(\(window.breakdown))", category: .swPlayback)
+        scaler = lighter.scaler
+        stage?.release()
+        stage = nil
+        buildGeneration += 1
+        if let buildQueue {
+            buildAsync(lighter, mlOnly: false, on: buildQueue, generation: buildGeneration)
+        } else {
+            do {
+                stage = try Stage(plan: lighter, gpu: gpu)
+            } catch {
+                disable(reason: "over budget, " + over + "; C4F16 not built: \(error)")
+                return
+            }
+        }
+        degraded = true
+        firstFrameSent = true
+        recentTimes.removeAll()
+        stageFrames = 0
+        timingLines = 0
+        stateLock.lock()
+        _isDegraded = true
+        _deliveredPlan = lighter
+        let stats = _stats
+        let handler = _onEvent
+        stateLock.unlock()
+        handler?(.degraded(lighter, reason: "ArtCNN C4F32 over budget, " + over, stats: stats))
     }
 
     /// The line-art stage's top rung overran: remember it, rebuild without the restore pass (the kernels are
@@ -993,12 +1053,16 @@ private final class Stage {
     init(plan: UpscalePlan, gpu: GPU, mlOnly: Bool = false, restores: Bool = true) throws {
         self.plan = plan
         self.gpu = gpu
-        if plan.scaler == .lineArt {
+        if plan.scaler.isNetwork2x {
             ml = nil
+            let stage: any FrameChainStage = plan.scaler.artCNNModel.map { ArtCNNStage(model: $0) }
+                ?? LineArtStage(restores: restores)
             chain = try FrameChain(device: gpu.device, queue: gpu.queue,
                                    sourceWidth: plan.sourceWidth, sourceHeight: plan.sourceHeight,
                                    targetWidth: plan.targetWidth, targetHeight: plan.targetHeight,
-                                   stages: [LineArtStage(restores: restores)])
+                                   stages: [stage])
+            // ArtCNN keeps the coded shape (exactly 2x), so the output keeps the source's pixel aspect.
+            if plan.scaler.artCNNModel != nil { sourcePAR = (plan.sarNum, plan.sarDen) }
             scaler = nil; rgba = nil; scaled = nil
             return
         }

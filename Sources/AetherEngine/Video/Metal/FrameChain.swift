@@ -41,6 +41,9 @@ final class FrameChain {
     private let rgb: MTLTexture?
     /// One kernel from the input planes to the output planes, no RGB texture.
     let isRoundTripOnly: Bool
+    /// Fork: the chain's only stage reads the input planes and writes the output planes itself
+    /// (`FrameChainStage.isPlanar`, the ArtCNN stage): no RGB texture and neither conversion.
+    let isPlanarOnly: Bool
     /// The tone map the round-trip kernel runs on each sample, when a stage fuses one into it.
     private let roundTripToneMap: FrameChainToneMapParams?
     private var outputPools: [OSType: CVPixelBufferPool] = [:]
@@ -74,6 +77,18 @@ final class FrameChain {
         self.targetHeight = targetHeight
         self.stages = stages
         let toneMaps = stages.compactMap(\.fusedToneMap)
+        isPlanarOnly = stages.count == 1 && stages[0].isPlanar
+        if isPlanarOnly {
+            isRoundTripOnly = false
+            roundTripToneMap = nil
+            rgb = nil
+            let size = try stages[0].prepare(io: io, kernels: kernels, input: (sourceWidth, sourceHeight),
+                                             finalTarget: (targetWidth, targetHeight))
+            guard size == (targetWidth, targetHeight) else {
+                throw Failure("planar stage makes \(size.0)x\(size.1), not the target \(targetWidth)x\(targetHeight)")
+            }
+            return
+        }
         isRoundTripOnly = fusesRoundTrip && toneMaps.count <= 1
             && stages.allSatisfy { $0.isIdentity || $0.fusedToneMap != nil }
             && sourceWidth == targetWidth && sourceHeight == targetHeight
@@ -141,7 +156,7 @@ final class FrameChain {
         let lumaFormat: MTLPixelFormat = tenBit ? .r16Unorm : .r8Unorm
         let chromaFormat: MTLPixelFormat = tenBit ? .rg16Unorm : .rg8Unorm
         // The wide round trip sees luma and the output chroma as 4-sample texels (2 CbCr pairs for chroma).
-        let wide = rgb == nil && Self.roundTripIsWide(targetWidth: targetWidth, pictureX: picture.x)
+        let wide = rgb == nil && !isPlanarOnly && Self.roundTripIsWide(targetWidth: targetWidth, pictureX: picture.x)
         let wideFormat: MTLPixelFormat = tenBit ? .rgba16Unorm : .rgba8Unorm
         let lease = io.lease()
         let iy = try planeTexture(input, plane: 0, format: wide ? wideFormat : lumaFormat, widthDivisor: wide ? 4 : 1, lease)
@@ -153,7 +168,10 @@ final class FrameChain {
             throw Failure("no command buffer")
         }
         enc.setBytes(&params, length: MemoryLayout<FrameChainColorParams>.size, index: 0)
-        if let rgb {
+        if isPlanarOnly, let stage = stages.first {
+            stage.encodePlanar(enc, luma: iy, chroma: ic, outLuma: oy, outChroma: oc,
+                               tenBit: tenBit, origin: (picture.x, picture.y))
+        } else if let rgb {
             Self.dispatch(enc, kernels.toRGB, textures: [iy, ic, rgb], grid: (sourceWidth, sourceHeight), io: io)
             var current = rgb
             var written = false
@@ -252,6 +270,13 @@ protocol FrameChainStage: AnyObject {
     /// A per-pixel stage the one round-trip kernel can run on each sample instead of `encode`: a chain of
     /// identity stages and one such stage, at its own size, needs no RGB texture.
     var fusedToneMap: FrameChainToneMapParams? { get }
+    /// Fork: true for a stage that works on the Y'CbCr planes (`encodePlanar`) instead of RGB. As a chain's only
+    /// stage it reads the input planes and writes the output planes; `prepare` returns the target size.
+    var isPlanar: Bool { get }
+    /// The planar stage's whole work: the input planes (whole buffers; the picture starts at `origin`, even)
+    /// to the output planes. The chain's colour parameters are bound at buffer 0.
+    func encodePlanar(_ encoder: MTLComputeCommandEncoder, luma: MTLTexture, chroma: MTLTexture,
+                      outLuma: MTLTexture, outChroma: MTLTexture, tenBit: Bool, origin: (Int, Int))
 }
 
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
@@ -259,6 +284,9 @@ extension FrameChainStage {
     var isIdentity: Bool { false }
     var outputColorVolume: FrameChainColorVolume { .unchanged }
     var fusedToneMap: FrameChainToneMapParams? { nil }
+    var isPlanar: Bool { false }
+    func encodePlanar(_ encoder: MTLComputeCommandEncoder, luma: MTLTexture, chroma: MTLTexture,
+                      outLuma: MTLTexture, outChroma: MTLTexture, tenBit: Bool, origin: (Int, Int)) {}
     func encodeFinal(_ encoder: MTLComputeCommandEncoder, input: MTLTexture, luma: MTLTexture, chroma: MTLTexture) -> Bool {
         false
     }

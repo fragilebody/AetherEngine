@@ -220,16 +220,35 @@ struct PerFrameBenchmark {
         case metalFX720 = "upscale: 720p to 2160p, MetalFX only, wall time"
         case lineArt1080 = "upscale: 1080p to 2160p, line art, wall time"
         case lineArtRestore1080 = "upscale: 1080p to 2160p, line art with restore, wall time"
+        case artCNNC4F16_1080 = "upscale: 1080p to 2160p, ArtCNN C4F16, wall time"
+        case artCNNC4F16_1080_10bit = "upscale: 1080p 10-bit to 2160p, ArtCNN C4F16, wall time"
+        case artCNNC4F16_720 = "upscale: 720p to 1440p, ArtCNN C4F16, wall time"
+        case artCNNC4F32_1080 = "upscale: 1080p to 2160p, ArtCNN C4F32, wall time"
+        case artCNNC4F32_720 = "upscale: 720p to 1440p, ArtCNN C4F32, wall time"
+        case artCNNC4F32_480 = "upscale: 480p to 960p, ArtCNN C4F32, wall time"
 
         /// The coded source: 16:9 DVD (720x480, 32:27 pixels), 720p, 1080p.
         var source: SourceGeometry {
             switch self {
-            case .automatic480: return SourceGeometry(width: 720, height: 480, sarNum: 32, sarDen: 27)
-            case .automatic720, .metalFX720: return SourceGeometry(width: 1280, height: 720, sarNum: 1, sarDen: 1)
-            case .lineArt1080, .lineArtRestore1080: return SourceGeometry(width: 1920, height: 1080, sarNum: 1, sarDen: 1)
+            case .automatic480, .artCNNC4F32_480: return SourceGeometry(width: 720, height: 480, sarNum: 32, sarDen: 27)
+            case .automatic720, .metalFX720, .artCNNC4F16_720, .artCNNC4F32_720:
+                return SourceGeometry(width: 1280, height: 720, sarNum: 1, sarDen: 1)
+            case .lineArt1080, .lineArtRestore1080, .artCNNC4F16_1080, .artCNNC4F16_1080_10bit, .artCNNC4F32_1080:
+                return SourceGeometry(width: 1920, height: 1080, sarNum: 1, sarDen: 1)
             }
         }
-        var scaler: UpscaleScaler { self == .lineArt1080 || self == .lineArtRestore1080 ? .lineArt : .automatic }
+        var scaler: UpscaleScaler {
+            switch self {
+            case .lineArt1080, .lineArtRestore1080: return .lineArt
+            case .artCNNC4F16_1080, .artCNNC4F16_1080_10bit, .artCNNC4F16_720: return .artCNN(.c4f16)
+            case .artCNNC4F32_1080, .artCNNC4F32_720, .artCNNC4F32_480: return .artCNN(.c4f32)
+            case .automatic480, .automatic720, .metalFX720: return .automatic
+            }
+        }
+        var pixelFormat: OSType {
+            self == .artCNNC4F16_1080_10bit ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        }
     }
 
     /// The display every upscale case fills.
@@ -248,9 +267,8 @@ struct PerFrameBenchmark {
         let factors: (Int, Int) -> [Float] = { metalFXOnly ? [] : FrameUpscaler.mlScaleFactors($0, $1) }
         guard let plan = UpscaleRouteDecision.makePlan(source: source, display: Self.upscaleDisplay,
                                                        mlScaleFactors: factors, scaler: upscaleCase.scaler),
-              let frame = Self.makeFrame(width: source.width, height: source.height,
-                                         format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
-        else { return Self.skipped(name, "no plan or no \(source.width)x\(source.height) NV12 buffer") }
+              let frame = Self.makeFrame(width: source.width, height: source.height, format: upscaleCase.pixelFormat)
+        else { return Self.skipped(name, "no plan or no \(source.width)x\(source.height) buffer") }
         let stage: UpscaleBenchmarkStage
         do {
             stage = try UpscaleBenchmarkStage(plan: plan, restores: upscaleCase == .lineArtRestore1080)
@@ -289,6 +307,8 @@ struct PerFrameBenchmark {
             if plan.mlOutputWidth != plan.targetWidth || plan.mlOutputHeight != plan.targetHeight {
                 steps.append("bilinear \(plan.targetWidth)x\(plan.targetHeight)")
             }
+        case .artCNN(let model):
+            steps.append("ArtCNN \(model.rawValue.uppercased()) \(plan.targetWidth)x\(plan.targetHeight)")
         case .automatic:
             if let scale = plan.mlScale {
                 steps.append("ML " + String(format: "%g", scale) + "x \(plan.mlOutputWidth)x\(plan.mlOutputHeight)")

@@ -28,6 +28,12 @@ struct PerFrameBenchmarkReportsEveryCaseTests {
             "upscale: 720p to 2160p, MetalFX only, wall time",
             "upscale: 1080p to 2160p, line art, wall time",
             "upscale: 1080p to 2160p, line art with restore, wall time",
+            "upscale: 1080p to 2160p, ArtCNN C4F16, wall time",
+            "upscale: 1080p 10-bit to 2160p, ArtCNN C4F16, wall time",
+            "upscale: 720p to 1440p, ArtCNN C4F16, wall time",
+            "upscale: 1080p to 2160p, ArtCNN C4F32, wall time",
+            "upscale: 720p to 1440p, ArtCNN C4F32, wall time",
+            "upscale: 480p to 960p, ArtCNN C4F32, wall time",
         ])
         // A case either ran with ordered numbers or was skipped with a reason.
         let consistent = report.results.allSatisfy { result in
