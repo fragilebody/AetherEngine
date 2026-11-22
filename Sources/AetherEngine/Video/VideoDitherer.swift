@@ -129,7 +129,9 @@ public final class VideoDitherer: @unchecked Sendable {
     private let noOverlay: MTLTexture
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
-    private let textureCache: CVMetalTextureCache
+    /// The frame's planes and the output, kept per surface (`SurfaceTextureCache`): CoreVideo's cache
+    /// made new ones every frame.
+    private let textures: SurfaceTextureCache
     private let lock = NSLock()
     /// The threshold matrix in use. A fruit matrix the process has not built yet is built in the
     /// background; the ordered one stands in until then, so no frame waits for it or goes undithered.
@@ -153,9 +155,6 @@ public final class VideoDitherer: @unchecked Sendable {
     init?(options: VideoDitherOptions, deband: VideoDebandOptions? = nil, device: MTLDevice? = nil,
           synchronousMatrix: Bool) {
         guard let device = device ?? MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
-        var cache: CVMetalTextureCache?
-        guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
-              let cache else { return nil }
         self.options = options
         self.deband = deband
         let bits = options.resolvedBits
@@ -185,7 +184,7 @@ public final class VideoDitherer: @unchecked Sendable {
         self.device = device
         self.queue = queue
         self.pipeline = pipeline
-        self.textureCache = cache
+        self.textures = SurfaceTextureCache(device: device)
         self.matrix = first.texture
         self.matrixSize = first.size
         self.matrixIsFruit = fruit != nil
@@ -235,9 +234,10 @@ public final class VideoDitherer: @unchecked Sendable {
         let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
         guard width > 0, height > 0,
               let output = makeOutput(width: width, height: height),
-              let luma = planeTexture(buffer, plane: 0, format: layout.bits > 8 ? .r16Unorm : .r8Unorm),
-              let chroma = planeTexture(buffer, plane: 1, format: layout.bits > 8 ? .rg16Unorm : .rg8Unorm),
-              let target = targetTexture(output),
+              let luma = textures.texture(buffer, plane: 0, format: layout.bits > 8 ? .r16Unorm : .r8Unorm),
+              let chroma = textures.texture(buffer, plane: 1, format: layout.bits > 8 ? .rg16Unorm : .rg8Unorm),
+              let target = textures.texture(output, format: outputBits >= 10 ? .bgr10a2Unorm : .bgra8Unorm,
+                                            usage: [.renderTarget, .shaderRead]),
               let commands = queue.makeCommandBuffer()
         else { return failed("no buffer or texture for a \(width)x\(height) frame") }
 
@@ -245,7 +245,7 @@ public final class VideoDitherer: @unchecked Sendable {
         var params = Self.params(layout: layout, matrix: UpscaleMatrix.of(buffer), bits: outputBits,
                                  matrixSize: options.algorithm == .none ? 0 : matrixSize,
                                  chromaOffset: Self.chromaOffset(of: buffer, luma: (width, height),
-                                                                 chroma: (chroma.texture.width, chroma.texture.height)),
+                                                                 chroma: (chroma.width, chroma.height)),
                                  phase: Self.phase(frame: frameIndex, options: options),
                                  deband: deband, debandRangeScale: debandRangeScale,
                                  frameIndex: UInt32(truncatingIfNeeded: frameIndex),
@@ -253,23 +253,21 @@ public final class VideoDitherer: @unchecked Sendable {
         frameIndex &+= 1
 
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = target.texture
+        pass.colorAttachments[0].texture = target
         pass.colorAttachments[0].loadAction = .dontCare
         pass.colorAttachments[0].storeAction = .store
         guard let encoder = commands.makeRenderCommandEncoder(descriptor: pass) else { return failed("no render encoder") }
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentBytes(&params, length: MemoryLayout<DitherShaderParams>.stride, index: 0)
-        encoder.setFragmentTexture(luma.texture, index: 0)
-        encoder.setFragmentTexture(chroma.texture, index: 1)
+        encoder.setFragmentTexture(luma, index: 0)
+        encoder.setFragmentTexture(chroma, index: 1)
         encoder.setFragmentTexture(matrix, index: 2)
         encoder.setFragmentTexture(placed?.texture ?? noOverlay, index: 3)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         commands.commit()
+        // Waited for here, so `buffer` and `output` (which hold the surfaces) outlive the GPU's use of them.
         commands.waitUntilCompleted()
-        // The CVMetalTextures must live until the GPU is done with them.
-        withExtendedLifetime((luma.reference, chroma.reference, target.reference)) {}
-        CVMetalTextureCacheFlush(textureCache, 0)
         _lastGPUSeconds = max(0, commands.gpuEndTime - commands.gpuStartTime)
         guard commands.status == .completed else {
             return failed("command buffer \(commands.status.rawValue): \(commands.error.map { "\($0)" } ?? "no error")")
@@ -431,34 +429,10 @@ public final class VideoDitherer: @unchecked Sendable {
 
     // MARK: - Buffers
 
-    private struct CacheTexture {
-        let reference: CVMetalTexture
-        let texture: MTLTexture
-    }
-
-    private func planeTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) -> CacheTexture? {
-        var reference: CVMetalTexture?
-        guard CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, textureCache, buffer, nil, format,
-            CVPixelBufferGetWidthOfPlane(buffer, plane), CVPixelBufferGetHeightOfPlane(buffer, plane), plane,
-            &reference) == kCVReturnSuccess,
-              let reference, let texture = CVMetalTextureGetTexture(reference) else { return nil }
-        return CacheTexture(reference: reference, texture: texture)
-    }
-
-    private func targetTexture(_ buffer: CVPixelBuffer) -> CacheTexture? {
-        var reference: CVMetalTexture?
-        let usage: MTLTextureUsage = [.renderTarget, .shaderRead]
-        let attributes = [kCVMetalTextureUsage as String: usage.rawValue] as CFDictionary
-        guard CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, textureCache, buffer, attributes, outputBits >= 10 ? .bgr10a2Unorm : .bgra8Unorm,
-            CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer), 0, &reference) == kCVReturnSuccess,
-              let reference, let texture = CVMetalTextureGetTexture(reference) else { return nil }
-        return CacheTexture(reference: reference, texture: texture)
-    }
-
     private func makeOutput(width: Int, height: Int) -> CVPixelBuffer? {
         if pool == nil || poolSize != (width, height) {
+            // Frames of another size: neither the old input surfaces nor the old pool's come back.
+            textures.removeAll()
             let attributes: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: outputPixelFormat,
                 kCVPixelBufferWidthKey as String: width,
